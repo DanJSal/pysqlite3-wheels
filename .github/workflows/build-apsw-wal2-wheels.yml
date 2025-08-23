@@ -47,8 +47,8 @@ jobs:
           echo "WAL2_SHA=$WAL2_SHA"
           echo "$WAL2_SHA" > ../WAL2_SHA.txt
           fossil update "$WAL2_SHA"
-          tclsh ./tool/mksqlite3c.tcl
           tclsh ./tool/mksqlite3h.tcl
+          tclsh ./tool/mksqlite3c.tcl
 
           cp src/sqlite3ext.h .
 
