@@ -34,29 +34,26 @@ jobs:
       - name: Install prerequisites
         run: |
           sudo apt-get update
-          sudo apt-get install -y fossil tcl tcl8.6 build-essential
+          sudo apt-get install -y fossil tcl build-essential
 
-      - name: Clone SQLite fossil repo (wal2 HEAD, pin to exact SHA) & generate amalgamation
+      - name: Clone SQLite fossil repo (wal2 HEAD, pin to exact SHA)
         run: |
           set -euxo pipefail
           mkdir sqlite-src && cd sqlite-src
           fossil clone https://sqlite.org/src sqlite.fossil
           mkdir repo && cd repo
           fossil open ../sqlite.fossil
-          fossil update ${SQLITE_WAL2_BRANCH}          # get latest wal2
+          fossil update ${SQLITE_WAL2_BRANCH}
           WAL2_SHA=$(fossil info | awk '/^checkout:/ {print $2}')
           echo "WAL2_SHA=$WAL2_SHA"
-          echo "$WAL2_SHA" > ../WAL2_SHA.txt           # save the pinned commit
-          fossil update "$WAL2_SHA"                    # re-checkout exact commit
-
-          # 1) Prepare generated sources & headers under tsrc/
-          make target_source
-
-          # 2) Build the amalgamation (reads tsrc/sqlite3.h, tsrc/*.c)
-          tclsh ./tool/mksqlite3c.tcl --linemacros=0
-
-          # 3) Ensure top-level headers exist for artifact consumers
-          cp tsrc/sqlite3.h .
+          echo "$WAL2_SHA" > ../WAL2_SHA.txt
+          fossil update "$WAL2_SHA"
+      - name: Configure & build amalgamation (sqlite3.c / sqlite3.h)
+        run: |
+          set -euxo pipefail
+          cd sqlite-src/repo
+          ./configure
+          make sqlite3.c sqlite3.h
           cp tsrc/sqlite3ext.h . || cp src/sqlite3ext.h .
 
       - name: Upload amalgamation artifact (incl. pinned SHA)
