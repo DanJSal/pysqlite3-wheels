@@ -48,6 +48,7 @@ jobs:
           echo "WAL2_SHA=$WAL2_SHA"
           echo "$WAL2_SHA" > ../WAL2_SHA.txt
           fossil update "$WAL2_SHA"
+
       - name: Configure & build amalgamation (sqlite3.c / sqlite3.h)
         run: |
           set -euxo pipefail
@@ -56,15 +57,20 @@ jobs:
           make sqlite3.c sqlite3.h
           cp tsrc/sqlite3ext.h . || cp src/sqlite3ext.h .
 
+      - name: Stage files for upload (flatten)
+        run: |
+          set -euxo pipefail
+          mkdir -p sqlite-src/out
+          cp sqlite-src/repo/sqlite3.c sqlite-src/out/
+          cp sqlite-src/repo/sqlite3.h sqlite-src/out/
+          cp sqlite-src/repo/sqlite3ext.h sqlite-src/out/
+          cp sqlite-src/WAL2_SHA.txt sqlite-src/out/
+
       - name: Upload amalgamation artifact (incl. pinned SHA)
         uses: actions/upload-artifact@v4
         with:
           name: sqlite-wal2-amalgamation
-          path: |
-            sqlite-src/WAL2_SHA.txt
-            sqlite-src/repo/sqlite3.c
-            sqlite-src/repo/sqlite3.h
-            sqlite-src/repo/sqlite3ext.h
+          path: sqlite-src/out/*
 
   linux-manylinux:
     name: Linux manylinux wheels (cp39–cp312, x86_64 & aarch64)
