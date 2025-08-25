@@ -28,14 +28,17 @@ env:
 
 jobs:
   prep-sqlite-amalgamation:
-    name: Prepare SQLite WAL2 amalgamation
+    name: Prepare SQLite WAL2 amalgamation (cached by SHA)
     runs-on: ubuntu-latest
     steps:
       - name: Install prerequisites
         run: |
           sudo apt-get update
           sudo apt-get install -y fossil tcl build-essential
-      - name: Clone SQLite fossil repo (wal2 HEAD, pin to exact SHA)
+  
+      # Get the exact WAL2 commit SHA and expose it as an output
+      - name: Resolve WAL2 SHA
+        id: wal2
         run: |
           set -euxo pipefail
           mkdir sqlite-src && cd sqlite-src
@@ -44,24 +47,30 @@ jobs:
           fossil open ../sqlite.fossil
           fossil update ${SQLITE_WAL2_BRANCH}
           WAL2_SHA=$(fossil info | awk '/^checkout:/ {print $2}')
-          echo "WAL2_SHA=$WAL2_SHA"
-          echo "$WAL2_SHA" > ../WAL2_SHA.txt
-          fossil update "$WAL2_SHA"
+          echo "sha=$WAL2_SHA" >> $GITHUB_OUTPUT
+  
+      # Restore previously built amalgamation if this exact SHA was built before
+      - name: Restore amalgamation cache
+        id: cache-amalg
+        uses: actions/cache@v4
+        with:
+          path: sqlite-src/out
+          key: sqlite-wal2-${{ steps.wal2.outputs.sha }}
+  
+      # Build only if cache miss
       - name: Configure & build amalgamation (sqlite3.c / sqlite3.h)
+        if: steps.cache-amalg.outputs.cache-hit != 'true'
         run: |
           set -euxo pipefail
           cd sqlite-src/repo
+          fossil update "${{ steps.wal2.outputs.sha }}"
           ./configure
           make sqlite3.c sqlite3.h
           cp tsrc/sqlite3ext.h . || cp src/sqlite3ext.h .
-      - name: Stage files for upload (flatten)
-        run: |
-          set -euxo pipefail
-          mkdir -p sqlite-src/out
-          cp sqlite-src/repo/sqlite3.c sqlite-src/out/
-          cp sqlite-src/repo/sqlite3.h sqlite-src/out/
-          cp sqlite-src/repo/sqlite3ext.h sqlite-src/out/
-          cp sqlite-src/WAL2_SHA.txt sqlite-src/out/
+          mkdir -p ../out
+          cp sqlite3.c sqlite3.h sqlite3ext.h ../out/
+          echo "${{ steps.wal2.outputs.sha }}" > ../out/WAL2_SHA.txt
+  
       - name: Upload amalgamation artifact (incl. pinned SHA)
         uses: actions/upload-artifact@v4
         with:
