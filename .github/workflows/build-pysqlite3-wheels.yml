@@ -1,4 +1,4 @@
-name: Build pysqlite3 (SQLite WAL2) wheels with NAN/INF
+name: Build pysqlite3 (SQLite WAL2) wheels — enforce all compile options
 
 on:
   workflow_dispatch:
@@ -6,8 +6,12 @@ on:
     tags: ["wheels-*"]
 
 env:
-  # Build WAL2; change to a specific wal2 sub-branch or SHA for determinism.
+  # Choose which SQLite branch to build:
+  # - "wal2" (default) tracks WAL2 tip. For determinism, pin to a wal2-* sub-branch or a specific SHA.
+  # - "trunk" if you don't want WAL2.
   SQLITE_WAL2_BRANCH: "wal2"
+
+  # POSIX-style defines (used in env, and also injected via defines.h to make flags deterministic)
   POSIX_SQLITE_DEFINES: >-
     -DSQLITE_ENABLE_JSON1=1
     -DSQLITE_ENABLE_FTS5=1
@@ -25,6 +29,7 @@ env:
     -DSQLITE_THREADSAFE=2
     -DSQLITE_OMIT_DEPRECATED=1
     -DSQLITE_ENABLE_NAN_INF=1
+
   PYSQLITE3_VERSION: "0.5.4"
 
 jobs:
@@ -76,6 +81,14 @@ jobs:
           name: sqlite-wal2-amalgamation
           path: sqlite-src/out/*
 
+  # ---------- Helpers reused in post-build checks ----------
+  # Python snippet used by all build jobs to assert compile options & do quick functional probes.
+  # (Duplicated in each job via here-doc for simplicity/portability.)
+  # It tolerates options rendered as NAME=VALUE (e.g., THREADSAFE=2).
+  # The script exits nonzero if any required option is missing.
+  # Required options include: FTS5, RTREE, STAT4, MATH_FUNCTIONS, NORMALIZE, COLUMN_METADATA,
+  # DBPAGE_VTAB, DBSTAT_VTAB, STMTVTAB, LIKE_DOESNT_MATCH_BLOBS, DEFAULT_MEMSTATUS, THREADSAFE, OMIT_DEPRECATED, ENABLE_NAN_INF.
+
   # ---------- Linux manylinux ----------
   linux-manylinux-x86_64:
     name: Linux manylinux wheels (cp39–cp312, x86_64)
@@ -99,17 +112,34 @@ jobs:
           name: sqlite-wal2-amalgamation
           path: amalgamation
 
-      - name: Clone pysqlite3 and vendor amalgamation (+force NAN/INF)
+      - name: Clone pysqlite3 and vendor amalgamation (+prepend defines.h)
         run: |
           set -euxo pipefail
           git clone --depth 1 --branch "${PYSQLITE3_VERSION}" https://github.com/coleifer/pysqlite3.git pysqlite3-src
           cp amalgamation/sqlite3.c pysqlite3-src/
           cp amalgamation/sqlite3.h pysqlite3-src/
           cp amalgamation/sqlite3ext.h pysqlite3-src/
-          # Force-enable NAN/INF in case env flags are not propagated by the build system
-          { printf '#define SQLITE_ENABLE_NAN_INF 1\n'; cat pysqlite3-src/sqlite3.c; } > pysqlite3-src/sqlite3.c.new
+          cat > pysqlite3-src/defines.h <<'EOF'
+          #define SQLITE_ENABLE_JSON1 1
+          #define SQLITE_ENABLE_FTS5 1
+          #define SQLITE_ENABLE_RTREE 1
+          #define SQLITE_ENABLE_STAT4 1
+          #define SQLITE_ENABLE_MATH_FUNCTIONS 1
+          #define SQLITE_ENABLE_NORMALIZE 1
+          #define SQLITE_ENABLE_DESERIALIZE 1
+          #define SQLITE_ENABLE_DBPAGE_VTAB 1
+          #define SQLITE_ENABLE_DBSTAT_VTAB 1
+          #define SQLITE_ENABLE_STMTVTAB 1
+          #define SQLITE_ENABLE_COLUMN_METADATA 1
+          #define SQLITE_LIKE_DOESNT_MATCH_BLOBS 1
+          #define SQLITE_DEFAULT_MEMSTATUS 0
+          #define SQLITE_THREADSAFE 2
+          #define SQLITE_OMIT_DEPRECATED 1
+          #define SQLITE_ENABLE_NAN_INF 1
+          EOF
+          { printf '#include "defines.h"\n'; cat pysqlite3-src/sqlite3.c; } > pysqlite3-src/sqlite3.c.new
           mv pysqlite3-src/sqlite3.c.new pysqlite3-src/sqlite3.c
-          grep -q 'SQLITE_ENABLE_NAN_INF' pysqlite3-src/sqlite3.c
+          head -n 1 pysqlite3-src/sqlite3.c | grep -q 'defines.h'
 
       - uses: actions/setup-python@v5
         with:
@@ -122,22 +152,40 @@ jobs:
           CIBW_BUILD: "cp39-manylinux_* cp310-manylinux_* cp311-manylinux_* cp312-manylinux_*"
           CIBW_ARCHS_LINUX: "x86_64"
           CIBW_BEFORE_BUILD: "python -m pip install -U setuptools wheel && cd {package} && python setup.py build_static"
-          # Ensure flags stick for all compilation steps
+          # Make env flags stick for all tool invocations:
           CIBW_ENVIRONMENT_LINUX: 'CFLAGS="-O3 -fPIC -DNDEBUG ${{ env.POSIX_SQLITE_DEFINES }}" CPPFLAGS="$CFLAGS"'
           CIBW_BUILD_VERBOSITY: "1"
         run: python -m cibuildwheel pysqlite3-src --output-dir wheelhouse
 
-      - name: Verify NAN/INF in a wheel (cp312 on runner)
+      - name: Verify compile options + quick probes
         run: |
           set -euxo pipefail
           python -m pip install --no-index --find-links=wheelhouse "pysqlite3==${PYSQLITE3_VERSION}"
           python - <<'PY'
-import pysqlite3.dbapi2 as sqlite3, sys
-print("SQLite:", sqlite3.sqlite_version)
-ok = sqlite3.connect(":memory:").execute(
-    "select sqlite_compileoption_used('ENABLE_NAN_INF')").fetchone()[0] == 1
-print("ENABLE_NAN_INF:", ok)
-sys.exit(0 if ok else 1)
+import pysqlite3.dbapi2 as sqlite3, sys, os, tempfile
+con = sqlite3.connect(":memory:")
+opts = {row[0] for row in con.execute("pragma compile_options")}
+def present(name): return any(o==name or o.startswith(name+'=') for o in opts)
+want = [
+  "ENABLE_FTS5","ENABLE_RTREE","ENABLE_STAT4","ENABLE_MATH_FUNCTIONS",
+  "ENABLE_NORMALIZE","ENABLE_COLUMN_METADATA","ENABLE_DBPAGE_VTAB",
+  "ENABLE_DBSTAT_VTAB","ENABLE_STMTVTAB","LIKE_DOESNT_MATCH_BLOBS",
+  "DEFAULT_MEMSTATUS","THREADSAFE","OMIT_DEPRECATED","ENABLE_NAN_INF"
+]
+missing = [w for w in want if not present(w)]
+# functional probes for a few features:
+con.execute("CREATE VIRTUAL TABLE f USING fts5(x);")
+con.execute("CREATE VIRTUAL TABLE r USING rtree(id,minX,maxX,minY,maxY);")
+con.execute("SELECT sin(0.0), log(10.0);").fetchone()
+# WAL2 probe (file-backed)
+with tempfile.TemporaryDirectory() as d:
+    db = os.path.join(d,"t.db")
+    c = sqlite3.connect(db)
+    jm = c.execute("PRAGMA journal_mode=wal2;").fetchone()[0]
+    c.close()
+    wal2_ok = (jm == "wal2")
+print("Missing options:", missing)
+sys.exit(1 if missing or not wal2_ok else 0)
 PY
 
       - uses: actions/upload-artifact@v4
@@ -151,39 +199,50 @@ PY
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/cache@v4
         with:
           path: ~/.cache/pip
           key: pip-${{ runner.os }}-${{ hashFiles('**/pyproject.toml', '**/setup.cfg') }}
-
       - uses: actions/cache@v4
         with:
           path: ~/.cache/cibuildwheel
           key: cibw-${{ runner.os }}
-
       - uses: actions/download-artifact@v4
         with:
           name: sqlite-wal2-amalgamation
           path: amalgamation
-
-      - name: Clone pysqlite3 and vendor amalgamation (+force NAN/INF)
+      - name: Clone pysqlite3 and vendor amalgamation (+prepend defines.h)
         run: |
           set -euxo pipefail
           git clone --depth 1 --branch "${PYSQLITE3_VERSION}" https://github.com/coleifer/pysqlite3.git pysqlite3-src
           cp amalgamation/sqlite3.c pysqlite3-src/
           cp amalgamation/sqlite3.h pysqlite3-src/
           cp amalgamation/sqlite3ext.h pysqlite3-src/
-          { printf '#define SQLITE_ENABLE_NAN_INF 1\n'; cat pysqlite3-src/sqlite3.c; } > pysqlite3-src/sqlite3.c.new
+          cat > pysqlite3-src/defines.h <<'EOF'
+          #define SQLITE_ENABLE_JSON1 1
+          #define SQLITE_ENABLE_FTS5 1
+          #define SQLITE_ENABLE_RTREE 1
+          #define SQLITE_ENABLE_STAT4 1
+          #define SQLITE_ENABLE_MATH_FUNCTIONS 1
+          #define SQLITE_ENABLE_NORMALIZE 1
+          #define SQLITE_ENABLE_DESERIALIZE 1
+          #define SQLITE_ENABLE_DBPAGE_VTAB 1
+          #define SQLITE_ENABLE_DBSTAT_VTAB 1
+          #define SQLITE_ENABLE_STMTVTAB 1
+          #define SQLITE_ENABLE_COLUMN_METADATA 1
+          #define SQLITE_LIKE_DOESNT_MATCH_BLOBS 1
+          #define SQLITE_DEFAULT_MEMSTATUS 0
+          #define SQLITE_THREADSAFE 2
+          #define SQLITE_OMIT_DEPRECATED 1
+          #define SQLITE_ENABLE_NAN_INF 1
+          EOF
+          { printf '#include "defines.h"\n'; cat pysqlite3-src/sqlite3.c; } > pysqlite3-src/sqlite3.c.new
           mv pysqlite3-src/sqlite3.c.new pysqlite3-src/sqlite3.c
-          grep -q 'SQLITE_ENABLE_NAN_INF' pysqlite3-src/sqlite3.c
-
+          head -n 1 pysqlite3-src/sqlite3.c | grep -q 'defines.h'
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
       - run: python -m pip install -U pip cibuildwheel==2.*
-
       - name: Build wheels (native arm64)
         env:
           CIBW_BUILD: "cp39-manylinux_* cp310-manylinux_* cp311-manylinux_* cp312-manylinux_*"
@@ -192,19 +251,29 @@ PY
           CIBW_ENVIRONMENT_LINUX: 'CFLAGS="-O3 -fPIC -DNDEBUG ${{ env.POSIX_SQLITE_DEFINES }}" CPPFLAGS="$CFLAGS"'
           CIBW_BUILD_VERBOSITY: "1"
         run: python -m cibuildwheel pysqlite3-src --output-dir wheelhouse
-
-      - name: Verify NAN/INF in a wheel (cp312 on runner)
+      - name: Verify compile options + quick probes
         run: |
           set -euxo pipefail
           python -m pip install --no-index --find-links=wheelhouse "pysqlite3==${PYSQLITE3_VERSION}"
           python - <<'PY'
-import pysqlite3.dbapi2 as sqlite3, sys
-ok = sqlite3.connect(":memory:").execute(
-    "select sqlite_compileoption_used('ENABLE_NAN_INF')").fetchone()[0] == 1
-print("ENABLE_NAN_INF:", ok)
-sys.exit(0 if ok else 1)
+import pysqlite3.dbapi2 as sqlite3, sys, os, tempfile
+con = sqlite3.connect(":memory:")
+opts = {row[0] for row in con.execute("pragma compile_options")}
+def present(name): return any(o==name or o.startswith(name+'=') for o in opts)
+want = ["ENABLE_FTS5","ENABLE_RTREE","ENABLE_STAT4","ENABLE_MATH_FUNCTIONS","ENABLE_NORMALIZE","ENABLE_COLUMN_METADATA","ENABLE_DBPAGE_VTAB","ENABLE_DBSTAT_VTAB","ENABLE_STMTVTAB","LIKE_DOESNT_MATCH_BLOBS","DEFAULT_MEMSTATUS","THREADSAFE","OMIT_DEPRECATED","ENABLE_NAN_INF"]
+missing = [w for w in want if not present(w)]
+con.execute("CREATE VIRTUAL TABLE f USING fts5(x);")
+con.execute("CREATE VIRTUAL TABLE r USING rtree(id,minX,maxX,minY,maxY);")
+con.execute("SELECT sin(0.0), log(10.0);").fetchone()
+with tempfile.TemporaryDirectory() as d:
+    db = os.path.join(d,"t.db")
+    c = sqlite3.connect(db)
+    jm = c.execute("PRAGMA journal_mode=wal2;").fetchone()[0]
+    c.close()
+    wal2_ok = (jm == "wal2")
+print("Missing options:", missing)
+sys.exit(1 if missing or not wal2_ok else 0)
 PY
-
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-linux-manylinux-aarch64
@@ -217,39 +286,50 @@ PY
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/cache@v4
         with:
           path: ~/.cache/pip
           key: pip-${{ runner.os }}-${{ hashFiles('**/pyproject.toml', '**/setup.cfg') }}
-
       - uses: actions/cache@v4
         with:
           path: ~/.cache/cibuildwheel
           key: cibw-${{ runner.os }}
-
       - uses: actions/download-artifact@v4
         with:
           name: sqlite-wal2-amalgamation
           path: amalgamation
-
-      - name: Clone pysqlite3 and vendor amalgamation (+force NAN/INF)
+      - name: Clone pysqlite3 and vendor amalgamation (+prepend defines.h)
         run: |
           set -euxo pipefail
           git clone --depth 1 --branch "${PYSQLITE3_VERSION}" https://github.com/coleifer/pysqlite3.git pysqlite3-src
           cp amalgamation/sqlite3.c pysqlite3-src/
           cp amalgamation/sqlite3.h pysqlite3-src/
           cp amalgamation/sqlite3ext.h pysqlite3-src/
-          { printf '#define SQLITE_ENABLE_NAN_INF 1\n'; cat pysqlite3-src/sqlite3.c; } > pysqlite3-src/sqlite3.c.new
+          cat > pysqlite3-src/defines.h <<'EOF'
+          #define SQLITE_ENABLE_JSON1 1
+          #define SQLITE_ENABLE_FTS5 1
+          #define SQLITE_ENABLE_RTREE 1
+          #define SQLITE_ENABLE_STAT4 1
+          #define SQLITE_ENABLE_MATH_FUNCTIONS 1
+          #define SQLITE_ENABLE_NORMALIZE 1
+          #define SQLITE_ENABLE_DESERIALIZE 1
+          #define SQLITE_ENABLE_DBPAGE_VTAB 1
+          #define SQLITE_ENABLE_DBSTAT_VTAB 1
+          #define SQLITE_ENABLE_STMTVTAB 1
+          #define SQLITE_ENABLE_COLUMN_METADATA 1
+          #define SQLITE_LIKE_DOESNT_MATCH_BLOBS 1
+          #define SQLITE_DEFAULT_MEMSTATUS 0
+          #define SQLITE_THREADSAFE 2
+          #define SQLITE_OMIT_DEPRECATED 1
+          #define SQLITE_ENABLE_NAN_INF 1
+          EOF
+          { printf '#include "defines.h"\n'; cat pysqlite3-src/sqlite3.c; } > pysqlite3-src/sqlite3.c.new
           mv pysqlite3-src/sqlite3.c.new pysqlite3-src/sqlite3.c
-          grep -q 'SQLITE_ENABLE_NAN_INF' pysqlite3-src/sqlite3.c
-
+          head -n 1 pysqlite3-src/sqlite3.c | grep -q 'defines.h'
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
       - run: python -m pip install -U pip cibuildwheel==2.*
-
       - name: Build wheels
         env:
           CIBW_BUILD: "cp39-musllinux_* cp310-musllinux_* cp311-musllinux_* cp312-musllinux_*"
@@ -258,19 +338,29 @@ PY
           CIBW_ENVIRONMENT_LINUX: 'CFLAGS="-O3 -fPIC -DNDEBUG ${{ env.POSIX_SQLITE_DEFINES }}" CPPFLAGS="$CFLAGS"'
           CIBW_BUILD_VERBOSITY: "1"
         run: python -m cibuildwheel pysqlite3-src --output-dir wheelhouse
-
-      - name: Verify NAN/INF in a wheel (cp312 on runner)
+      - name: Verify compile options + quick probes
         run: |
           set -euxo pipefail
           python -m pip install --no-index --find-links=wheelhouse "pysqlite3==${PYSQLITE3_VERSION}"
           python - <<'PY'
-import pysqlite3.dbapi2 as sqlite3, sys
-ok = sqlite3.connect(":memory:").execute(
-    "select sqlite_compileoption_used('ENABLE_NAN_INF')").fetchone()[0] == 1
-print("ENABLE_NAN_INF:", ok)
-sys.exit(0 if ok else 1)
+import pysqlite3.dbapi2 as sqlite3, sys, os, tempfile
+con = sqlite3.connect(":memory:")
+opts = {row[0] for row in con.execute("pragma compile_options")}
+def present(name): return any(o==name or o.startswith(name+'=') for o in opts)
+want = ["ENABLE_FTS5","ENABLE_RTREE","ENABLE_STAT4","ENABLE_MATH_FUNCTIONS","ENABLE_NORMALIZE","ENABLE_COLUMN_METADATA","ENABLE_DBPAGE_VTAB","ENABLE_DBSTAT_VTAB","ENABLE_STMTVTAB","LIKE_DOESNT_MATCH_BLOBS","DEFAULT_MEMSTATUS","THREADSAFE","OMIT_DEPRECATED","ENABLE_NAN_INF"]
+missing = [w for w in want if not present(w)]
+con.execute("CREATE VIRTUAL TABLE f USING fts5(x);")
+con.execute("CREATE VIRTUAL TABLE r USING rtree(id,minX,maxX,minY,maxY);")
+con.execute("SELECT sin(0.0), log(10.0);").fetchone()
+with tempfile.TemporaryDirectory() as d:
+    db = os.path.join(d,"t.db")
+    c = sqlite3.connect(db)
+    jm = c.execute("PRAGMA journal_mode=wal2;").fetchone()[0]
+    c.close()
+    wal2_ok = (jm == "wal2")
+print("Missing options:", missing)
+sys.exit(1 if missing or not wal2_ok else 0)
 PY
-
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-linux-musllinux-x86_64
@@ -282,39 +372,50 @@ PY
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/cache@v4
         with:
           path: ~/.cache/pip
           key: pip-${{ runner.os }}-${{ hashFiles('**/pyproject.toml', '**/setup.cfg') }}
-
       - uses: actions/cache@v4
         with:
           path: ~/.cache/cibuildwheel
           key: cibw-${{ runner.os }}
-
       - uses: actions/download-artifact@v4
         with:
           name: sqlite-wal2-amalgamation
           path: amalgamation
-
-      - name: Clone pysqlite3 and vendor amalgamation (+force NAN/INF)
+      - name: Clone pysqlite3 and vendor amalgamation (+prepend defines.h)
         run: |
           set -euxo pipefail
           git clone --depth 1 --branch "${PYSQLITE3_VERSION}" https://github.com/coleifer/pysqlite3.git pysqlite3-src
           cp amalgamation/sqlite3.c pysqlite3-src/
           cp amalgamation/sqlite3.h pysqlite3-src/
           cp amalgamation/sqlite3ext.h pysqlite3-src/
-          { printf '#define SQLITE_ENABLE_NAN_INF 1\n'; cat pysqlite3-src/sqlite3.c; } > pysqlite3-src/sqlite3.c.new
+          cat > pysqlite3-src/defines.h <<'EOF'
+          #define SQLITE_ENABLE_JSON1 1
+          #define SQLITE_ENABLE_FTS5 1
+          #define SQLITE_ENABLE_RTREE 1
+          #define SQLITE_ENABLE_STAT4 1
+          #define SQLITE_ENABLE_MATH_FUNCTIONS 1
+          #define SQLITE_ENABLE_NORMALIZE 1
+          #define SQLITE_ENABLE_DESERIALIZE 1
+          #define SQLITE_ENABLE_DBPAGE_VTAB 1
+          #define SQLITE_ENABLE_DBSTAT_VTAB 1
+          #define SQLITE_ENABLE_STMTVTAB 1
+          #define SQLITE_ENABLE_COLUMN_METADATA 1
+          #define SQLITE_LIKE_DOESNT_MATCH_BLOBS 1
+          #define SQLITE_DEFAULT_MEMSTATUS 0
+          #define SQLITE_THREADSAFE 2
+          #define SQLITE_OMIT_DEPRECATED 1
+          #define SQLITE_ENABLE_NAN_INF 1
+          EOF
+          { printf '#include "defines.h"\n'; cat pysqlite3-src/sqlite3.c; } > pysqlite3-src/sqlite3.c.new
           mv pysqlite3-src/sqlite3.c.new pysqlite3-src/sqlite3.c
-          grep -q 'SQLITE_ENABLE_NAN_INF' pysqlite3-src/sqlite3.c
-
+          head -n 1 pysqlite3-src/sqlite3.c | grep -q 'defines.h'
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
       - run: python -m pip install -U pip cibuildwheel==2.*
-
       - name: Build wheels (native arm64)
         env:
           CIBW_BUILD: "cp39-musllinux_* cp310-musllinux_* cp311-musllinux_* cp312-musllinux_*"
@@ -323,19 +424,29 @@ PY
           CIBW_ENVIRONMENT_LINUX: 'CFLAGS="-O3 -fPIC -DNDEBUG ${{ env.POSIX_SQLITE_DEFINES }}" CPPFLAGS="$CFLAGS"'
           CIBW_BUILD_VERBOSITY: "1"
         run: python -m cibuildwheel pysqlite3-src --output-dir wheelhouse
-
-      - name: Verify NAN/INF in a wheel (cp312 on runner)
+      - name: Verify compile options + quick probes
         run: |
           set -euxo pipefail
           python -m pip install --no-index --find-links=wheelhouse "pysqlite3==${PYSQLITE3_VERSION}"
           python - <<'PY'
-import pysqlite3.dbapi2 as sqlite3, sys
-ok = sqlite3.connect(":memory:").execute(
-    "select sqlite_compileoption_used('ENABLE_NAN_INF')").fetchone()[0] == 1
-print("ENABLE_NAN_INF:", ok)
-sys.exit(0 if ok else 1)
+import pysqlite3.dbapi2 as sqlite3, sys, os, tempfile
+con = sqlite3.connect(":memory:")
+opts = {row[0] for row in con.execute("pragma compile_options")}
+def present(name): return any(o==name or o.startswith(name+'=') for o in opts)
+want = ["ENABLE_FTS5","ENABLE_RTREE","ENABLE_STAT4","ENABLE_MATH_FUNCTIONS","ENABLE_NORMALIZE","ENABLE_COLUMN_METADATA","ENABLE_DBPAGE_VTAB","ENABLE_DBSTAT_VTAB","ENABLE_STMTVTAB","LIKE_DOESNT_MATCH_BLOBS","DEFAULT_MEMSTATUS","THREADSAFE","OMIT_DEPRECATED","ENABLE_NAN_INF"]
+missing = [w for w in want if not present(w)]
+con.execute("CREATE VIRTUAL TABLE f USING fts5(x);")
+con.execute("CREATE VIRTUAL TABLE r USING rtree(id,minX,maxX,minY,maxY);")
+con.execute("SELECT sin(0.0), log(10.0);").fetchone()
+with tempfile.TemporaryDirectory() as d:
+    db = os.path.join(d,"t.db")
+    c = sqlite3.connect(db)
+    jm = c.execute("PRAGMA journal_mode=wal2;").fetchone()[0]
+    c.close()
+    wal2_ok = (jm == "wal2")
+print("Missing options:", missing)
+sys.exit(1 if missing or not wal2_ok else 0)
 PY
-
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-linux-musllinux-aarch64
@@ -348,30 +459,43 @@ PY
     runs-on: macos-13
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/download-artifact@v4
         with:
           name: sqlite-wal2-amalgamation
           path: amalgamation
-
-      - name: Clone pysqlite3 and vendor amalgamation (+force NAN/INF)
+      - name: Clone pysqlite3 and vendor amalgamation (+prepend defines.h)
         run: |
           set -euxo pipefail
           git clone --depth 1 --branch "${PYSQLITE3_VERSION}" https://github.com/coleifer/pysqlite3.git pysqlite3-src
           cp amalgamation/sqlite3.c pysqlite3-src/
           cp amalgamation/sqlite3.h pysqlite3-src/
           cp amalgamation/sqlite3ext.h pysqlite3-src/
-          # Portable insertion for macOS (BSD sed is finicky)
-          (printf '#define SQLITE_ENABLE_NAN_INF 1\n'; cat pysqlite3-src/sqlite3.c) > pysqlite3-src/sqlite3.c.new
+          (cat <<'EOF'
+          #define SQLITE_ENABLE_JSON1 1
+          #define SQLITE_ENABLE_FTS5 1
+          #define SQLITE_ENABLE_RTREE 1
+          #define SQLITE_ENABLE_STAT4 1
+          #define SQLITE_ENABLE_MATH_FUNCTIONS 1
+          #define SQLITE_ENABLE_NORMALIZE 1
+          #define SQLITE_ENABLE_DESERIALIZE 1
+          #define SQLITE_ENABLE_DBPAGE_VTAB 1
+          #define SQLITE_ENABLE_DBSTAT_VTAB 1
+          #define SQLITE_ENABLE_STMTVTAB 1
+          #define SQLITE_ENABLE_COLUMN_METADATA 1
+          #define SQLITE_LIKE_DOESNT_MATCH_BLOBS 1
+          #define SQLITE_DEFAULT_MEMSTATUS 0
+          #define SQLITE_THREADSAFE 2
+          #define SQLITE_OMIT_DEPRECATED 1
+          #define SQLITE_ENABLE_NAN_INF 1
+          EOF
+          ) > pysqlite3-src/defines.h
+          (printf '#include "defines.h"\n'; cat pysqlite3-src/sqlite3.c) > pysqlite3-src/sqlite3.c.new
           mv pysqlite3-src/sqlite3.c.new pysqlite3-src/sqlite3.c
-          grep -q 'SQLITE_ENABLE_NAN_INF' pysqlite3-src/sqlite3.c
-
+          head -n 1 pysqlite3-src/sqlite3.c | grep -q 'defines.h'
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
       - run: python -m pip install -U pip cibuildwheel==2.*
-
       - name: Build wheels
         env:
           CIBW_BUILD: "cp39-macosx_* cp310-macosx_* cp311-macosx_* cp312-macosx_*"
@@ -380,19 +504,29 @@ PY
           CIBW_ENVIRONMENT_MACOS: 'MACOSX_DEPLOYMENT_TARGET=10.9 CFLAGS="-O3 -fPIC -DNDEBUG ${{ env.POSIX_SQLITE_DEFINES }}" CPPFLAGS="$CFLAGS"'
           CIBW_BUILD_VERBOSITY: "1"
         run: python -m cibuildwheel pysqlite3-src --output-dir wheelhouse
-
-      - name: Verify NAN/INF in a wheel (cp312 on runner)
+      - name: Verify compile options + quick probes
         run: |
           set -euxo pipefail
           python -m pip install --no-index --find-links=wheelhouse "pysqlite3==${PYSQLITE3_VERSION}"
           python - <<'PY'
-import pysqlite3.dbapi2 as sqlite3, sys
-ok = sqlite3.connect(":memory:").execute(
-    "select sqlite_compileoption_used('ENABLE_NAN_INF')").fetchone()[0] == 1
-print("ENABLE_NAN_INF:", ok)
-sys.exit(0 if ok else 1)
+import pysqlite3.dbapi2 as sqlite3, sys, os, tempfile
+con = sqlite3.connect(":memory:")
+opts = {row[0] for row in con.execute("pragma compile_options")}
+def present(name): return any(o==name or o.startswith(name+'=') for o in opts)
+want = ["ENABLE_FTS5","ENABLE_RTREE","ENABLE_STAT4","ENABLE_MATH_FUNCTIONS","ENABLE_NORMALIZE","ENABLE_COLUMN_METADATA","ENABLE_DBPAGE_VTAB","ENABLE_DBSTAT_VTAB","ENABLE_STMTVTAB","LIKE_DOESNT_MATCH_BLOBS","DEFAULT_MEMSTATUS","THREADSAFE","OMIT_DEPRECATED","ENABLE_NAN_INF"]
+missing = [w for w in want if not present(w)]
+con.execute("CREATE VIRTUAL TABLE f USING fts5(x);")
+con.execute("CREATE VIRTUAL TABLE r USING rtree(id,minX,maxX,minY,maxY);")
+con.execute("SELECT sin(0.0), log(10.0);").fetchone()
+with tempfile.TemporaryDirectory() as d:
+    db = os.path.join(d,"t.db")
+    c = sqlite3.connect(db)
+    jm = c.execute("PRAGMA journal_mode=wal2;").fetchone()[0]
+    c.close()
+    wal2_ok = (jm == "wal2")
+print("Missing options:", missing)
+sys.exit(1 if missing or not wal2_ok else 0)
 PY
-
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-macos-x86_64
@@ -404,29 +538,43 @@ PY
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/download-artifact@v4
         with:
           name: sqlite-wal2-amalgamation
           path: amalgamation
-
-      - name: Clone pysqlite3 and vendor amalgamation (+force NAN/INF)
+      - name: Clone pysqlite3 and vendor amalgamation (+prepend defines.h)
         run: |
           set -euxo pipefail
           git clone --depth 1 --branch "${PYSQLITE3_VERSION}" https://github.com/coleifer/pysqlite3.git pysqlite3-src
           cp amalgamation/sqlite3.c pysqlite3-src/
           cp amalgamation/sqlite3.h pysqlite3-src/
           cp amalgamation/sqlite3ext.h pysqlite3-src/
-          (printf '#define SQLITE_ENABLE_NAN_INF 1\n'; cat pysqlite3-src/sqlite3.c) > pysqlite3-src/sqlite3.c.new
+          (cat <<'EOF'
+          #define SQLITE_ENABLE_JSON1 1
+          #define SQLITE_ENABLE_FTS5 1
+          #define SQLITE_ENABLE_RTREE 1
+          #define SQLITE_ENABLE_STAT4 1
+          #define SQLITE_ENABLE_MATH_FUNCTIONS 1
+          #define SQLITE_ENABLE_NORMALIZE 1
+          #define SQLITE_ENABLE_DESERIALIZE 1
+          #define SQLITE_ENABLE_DBPAGE_VTAB 1
+          #define SQLITE_ENABLE_DBSTAT_VTAB 1
+          #define SQLITE_ENABLE_STMTVTAB 1
+          #define SQLITE_ENABLE_COLUMN_METADATA 1
+          #define SQLITE_LIKE_DOESNT_MATCH_BLOBS 1
+          #define SQLITE_DEFAULT_MEMSTATUS 0
+          #define SQLITE_THREADSAFE 2
+          #define SQLITE_OMIT_DEPRECATED 1
+          #define SQLITE_ENABLE_NAN_INF 1
+          EOF
+          ) > pysqlite3-src/defines.h
+          (printf '#include "defines.h"\n'; cat pysqlite3-src/sqlite3.c) > pysqlite3-src/sqlite3.c.new
           mv pysqlite3-src/sqlite3.c.new pysqlite3-src/sqlite3.c
-          grep -q 'SQLITE_ENABLE_NAN_INF' pysqlite3-src/sqlite3.c
-
+          head -n 1 pysqlite3-src/sqlite3.c | grep -q 'defines.h'
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
       - run: python -m pip install -U pip cibuildwheel==2.*
-
       - name: Build wheels
         env:
           CIBW_BUILD: "cp39-macosx_* cp310-macosx_* cp311-macosx_* cp312-macosx_*"
@@ -435,19 +583,29 @@ PY
           CIBW_ENVIRONMENT_MACOS: 'MACOSX_DEPLOYMENT_TARGET=11.0 CFLAGS="-O3 -fPIC -DNDEBUG ${{ env.POSIX_SQLITE_DEFINES }}" CPPFLAGS="$CFLAGS"'
           CIBW_BUILD_VERBOSITY: "1"
         run: python -m cibuildwheel pysqlite3-src --output-dir wheelhouse
-
-      - name: Verify NAN/INF in a wheel (cp312 on runner)
+      - name: Verify compile options + quick probes
         run: |
           set -euxo pipefail
           python -m pip install --no-index --find-links=wheelhouse "pysqlite3==${PYSQLITE3_VERSION}"
           python - <<'PY'
-import pysqlite3.dbapi2 as sqlite3, sys
-ok = sqlite3.connect(":memory:").execute(
-    "select sqlite_compileoption_used('ENABLE_NAN_INF')").fetchone()[0] == 1
-print("ENABLE_NAN_INF:", ok)
-sys.exit(0 if ok else 1)
+import pysqlite3.dbapi2 as sqlite3, sys, os, tempfile
+con = sqlite3.connect(":memory:")
+opts = {row[0] for row in con.execute("pragma compile_options")}
+def present(name): return any(o==name or o.startswith(name+'=') for o in opts)
+want = ["ENABLE_FTS5","ENABLE_RTREE","ENABLE_STAT4","ENABLE_MATH_FUNCTIONS","ENABLE_NORMALIZE","ENABLE_COLUMN_METADATA","ENABLE_DBPAGE_VTAB","ENABLE_DBSTAT_VTAB","ENABLE_STMTVTAB","LIKE_DOESNT_MATCH_BLOBS","DEFAULT_MEMSTATUS","THREADSAFE","OMIT_DEPRECATED","ENABLE_NAN_INF"]
+missing = [w for w in want if not present(w)]
+con.execute("CREATE VIRTUAL TABLE f USING fts5(x);")
+con.execute("CREATE VIRTUAL TABLE r USING rtree(id,minX,maxX,minY,maxY);")
+con.execute("SELECT sin(0.0), log(10.0);").fetchone()
+with tempfile.TemporaryDirectory() as d:
+    db = os.path.join(d,"t.db")
+    c = sqlite3.connect(db)
+    jm = c.execute("PRAGMA journal_mode=wal2;").fetchone()[0]
+    c.close()
+    wal2_ok = (jm == "wal2")
+print("Missing options:", missing)
+sys.exit(1 if missing or not wal2_ok else 0)
 PY
-
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-macos-arm64
@@ -460,53 +618,76 @@ PY
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/download-artifact@v4
         with:
           name: sqlite-wal2-amalgamation
           path: amalgamation
-
-      - name: Clone pysqlite3 and vendor amalgamation (+force NAN/INF)
+      - name: Clone pysqlite3 and vendor amalgamation (+prepend defines.h)
         shell: pwsh
         run: |
           git clone --depth 1 --branch $env:PYSQLITE3_VERSION https://github.com/coleifer/pysqlite3.git pysqlite3-src
           Copy-Item amalgamation\sqlite3.c pysqlite3-src\
           Copy-Item amalgamation\sqlite3.h pysqlite3-src\
           Copy-Item amalgamation\sqlite3ext.h pysqlite3-src\
-          # Force-enable NAN/INF: prepend a define line
+          $defs = @'
+          #define SQLITE_ENABLE_JSON1 1
+          #define SQLITE_ENABLE_FTS5 1
+          #define SQLITE_ENABLE_RTREE 1
+          #define SQLITE_ENABLE_STAT4 1
+          #define SQLITE_ENABLE_MATH_FUNCTIONS 1
+          #define SQLITE_ENABLE_NORMALIZE 1
+          #define SQLITE_ENABLE_DESERIALIZE 1
+          #define SQLITE_ENABLE_DBPAGE_VTAB 1
+          #define SQLITE_ENABLE_DBSTAT_VTAB 1
+          #define SQLITE_ENABLE_STMTVTAB 1
+          #define SQLITE_ENABLE_COLUMN_METADATA 1
+          #define SQLITE_LIKE_DOESNT_MATCH_BLOBS 1
+          #define SQLITE_DEFAULT_MEMSTATUS 0
+          #define SQLITE_THREADSAFE 2
+          #define SQLITE_OMIT_DEPRECATED 1
+          #define SQLITE_ENABLE_NAN_INF 1
+          '@
+          Set-Content -Path "pysqlite3-src\defines.h" -Value $defs
           $p = "pysqlite3-src\sqlite3.c"
           $orig = Get-Content $p -Raw
-          "#define SQLITE_ENABLE_NAN_INF 1`r`n$orig" | Set-Content $p -NoNewline
-          Select-String -Path $p -Pattern "SQLITE_ENABLE_NAN_INF" | Out-Null
-
+          '#include "defines.h"' + "`r`n" + $orig | Set-Content $p -NoNewline
+          Select-String -Path $p -Pattern 'defines.h' | Out-Null
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
       - run: python -m pip install -U pip cibuildwheel==2.*
-
       - name: Build wheels
         env:
           CIBW_BUILD: "cp39-win_amd64 cp310-win_amd64 cp311-win_amd64 cp312-win_amd64"
           CIBW_ARCHS_WINDOWS: "AMD64"
           CIBW_BEFORE_BUILD_WINDOWS: "python -m pip install -U setuptools wheel && cd {package} && python setup.py build_static"
-          # Important: no inner quotes so MSVC picks up /D flags
+          # Important: no inner quotes so MSVC picks up /D flags (redundant with defines.h but harmless)
           CIBW_ENVIRONMENT_WINDOWS: CL=/O2 /DNDEBUG /DSQLITE_ENABLE_JSON1 /DSQLITE_ENABLE_FTS5 /DSQLITE_ENABLE_RTREE /DSQLITE_ENABLE_STAT4 /DSQLITE_ENABLE_MATH_FUNCTIONS /DSQLITE_ENABLE_NORMALIZE /DSQLITE_ENABLE_DESERIALIZE /DSQLITE_ENABLE_DBPAGE_VTAB /DSQLITE_ENABLE_DBSTAT_VTAB /DSQLITE_ENABLE_STMTVTAB /DSQLITE_ENABLE_COLUMN_METADATA /DSQLITE_LIKE_DOESNT_MATCH_BLOBS /DSQLITE_DEFAULT_MEMSTATUS=0 /DSQLITE_THREADSAFE=2 /DSQLITE_OMIT_DEPRECATED /DSQLITE_ENABLE_NAN_INF
           CIBW_BUILD_VERBOSITY: "1"
         run: python -m cibuildwheel pysqlite3-src --output-dir wheelhouse
-
-      - name: Verify NAN/INF in a wheel (cp312 on runner)
+      - name: Verify compile options + quick probes
         shell: pwsh
         run: |
           python -m pip install --no-index --find-links=wheelhouse "pysqlite3==$env:PYSQLITE3_VERSION"
           python - <<'PY'
-import pysqlite3.dbapi2 as sqlite3, sys
-ok = sqlite3.connect(":memory:").execute(
-    "select sqlite_compileoption_used('ENABLE_NAN_INF')").fetchone()[0] == 1
-print("ENABLE_NAN_INF:", ok)
-sys.exit(0 if ok else 1)
+import pysqlite3.dbapi2 as sqlite3, sys, os, tempfile
+con = sqlite3.connect(":memory:")
+opts = {row[0] for row in con.execute("pragma compile_options")}
+def present(name): return any(o==name or o.startswith(name+'=') for o in opts)
+want = ["ENABLE_FTS5","ENABLE_RTREE","ENABLE_STAT4","ENABLE_MATH_FUNCTIONS","ENABLE_NORMALIZE","ENABLE_COLUMN_METADATA","ENABLE_DBPAGE_VTAB","ENABLE_DBSTAT_VTAB","ENABLE_STMTVTAB","LIKE_DOESNT_MATCH_BLOBS","DEFAULT_MEMSTATUS","THREADSAFE","OMIT_DEPRECATED","ENABLE_NAN_INF"]
+missing = [w for w in want if not present(w)]
+con.execute("CREATE VIRTUAL TABLE f USING fts5(x);")
+con.execute("CREATE VIRTUAL TABLE r USING rtree(id,minX,maxX,minY,maxY);")
+con.execute("SELECT sin(0.0), log(10.0);").fetchone()
+with tempfile.TemporaryDirectory() as d:
+    db = os.path.join(d,"t.db")
+    c = sqlite3.connect(db)
+    jm = c.execute("PRAGMA journal_mode=wal2;").fetchone()[0]
+    c.close()
+    wal2_ok = (jm == "wal2")
+print("Missing options:", missing)
+sys.exit(1 if missing or not wal2_ok else 0)
 PY
-
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-windows-amd64
