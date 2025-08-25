@@ -8,7 +8,7 @@ on:
 
 env:
   # WAL2 source to build from. Use a specific SHA or keep "wal2" to follow the branch tip.
-  SQLITE_WAL2_BRANCH: "wal2"
+  SQLITE_WAL2_BRANCH: "trunk"
 
   # Bump this if you change the flag set below — it invalidates the prep cache.
   FLAGS_REV: "v1"
