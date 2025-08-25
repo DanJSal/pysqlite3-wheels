@@ -42,22 +42,18 @@ jobs:
           mkdir repo && cd repo
           fossil open ../sqlite.fossil
   
-      - name: Merge WAL2 pin into nan-inf check-in
+      - name: Merge WAL2 pin (base) <- nan-inf (reverse direction)
         id: merge
         run: |
           set -euxo pipefail
           cd sqlite-src/repo
-          # Start on nan-inf, then merge the WAL2 pin (often fewer conflicts this way)
-          fossil update "${NANINF_SHA}"
-          NAN_SHA=$(fossil info | awk '/^checkout:/ {print $2}')
-          fossil merge "${WAL2_PIN}"
-  
-          echo "wal2_sha=${WAL2_PIN}"   >> "$GITHUB_OUTPUT"
-          echo "naninf_sha=${NAN_SHA}"  >> "$GITHUB_OUTPUT"
-  
-          # Fail early if merge conflicts exist (prevents compiling conflict markers)
+          fossil update "${WAL2_PIN}"           # base = WAL2
+          BASE_SHA=$(fossil info | awk '/^checkout:/ {print $2}')
+          fossil merge "${NANINF_SHA}"          # merge nan-inf into WAL2
+          echo "wal2_sha=$BASE_SHA"   >> "$GITHUB_OUTPUT"
+          echo "naninf_sha=${NANINF_SHA}" >> "$GITHUB_OUTPUT"
           if grep -R "BEGIN MERGE CONFLICT" -n .; then
-            echo "Merge conflicts detected; try another WAL2 pin or reverse merge direction." >&2
+            echo "Merge conflicts detected (reverse direction). Try another WAL2 pin." >&2
             exit 1
           fi
   
