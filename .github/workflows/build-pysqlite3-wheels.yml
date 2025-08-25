@@ -69,31 +69,37 @@ jobs:
       - name: Inject compile flags into amalgamation (prepend to sqlite3.c)
         run: |
           set -euxo pipefail
-          test -f sqlite-src/out/sqlite3.c
-          if ! grep -q 'SQLITE_ENABLE_NAN_INF' sqlite-src/out/sqlite3.c; then
-            cat > sqlite-src/out/defines.pre.h <<'EOF'
-#define NDEBUG 1
-#define SQLITE_ENABLE_JSON1 1
-#define SQLITE_ENABLE_FTS5 1
-#define SQLITE_ENABLE_RTREE 1
-#define SQLITE_ENABLE_STAT4 1
-#define SQLITE_ENABLE_MATH_FUNCTIONS 1
-#define SQLITE_ENABLE_NORMALIZE 1
-#define SQLITE_ENABLE_DESERIALIZE 1
-#define SQLITE_ENABLE_DBPAGE_VTAB 1
-#define SQLITE_ENABLE_DBSTAT_VTAB 1
-#define SQLITE_ENABLE_STMTVTAB 1
-#define SQLITE_ENABLE_COLUMN_METADATA 1
-#define SQLITE_LIKE_DOESNT_MATCH_BLOBS 1
-#define SQLITE_DEFAULT_MEMSTATUS 0
-#define SQLITE_THREADSAFE 2
-#define SQLITE_OMIT_DEPRECATED 1
-#define SQLITE_ENABLE_NAN_INF 1
-EOF
-            cat sqlite-src/out/defines.pre.h sqlite-src/out/sqlite3.c > sqlite-src/out/sqlite3.c.new
-            mv sqlite-src/out/sqlite3.c.new sqlite-src/out/sqlite3.c
+          f=sqlite-src/out/sqlite3.c
+          test -f "$f"
+      
+          # Only prepend once (safe if cache is reused)
+          if ! grep -q 'SQLITE_ENABLE_NAN_INF' "$f"; then
+            tmp=$(mktemp)
+            {
+              echo '#define NDEBUG 1'
+              echo '#define SQLITE_ENABLE_JSON1 1'
+              echo '#define SQLITE_ENABLE_FTS5 1'
+              echo '#define SQLITE_ENABLE_RTREE 1'
+              echo '#define SQLITE_ENABLE_STAT4 1'
+              echo '#define SQLITE_ENABLE_MATH_FUNCTIONS 1'
+              echo '#define SQLITE_ENABLE_NORMALIZE 1'
+              echo '#define SQLITE_ENABLE_DESERIALIZE 1'
+              echo '#define SQLITE_ENABLE_DBPAGE_VTAB 1'
+              echo '#define SQLITE_ENABLE_DBSTAT_VTAB 1'
+              echo '#define SQLITE_ENABLE_STMTVTAB 1'
+              echo '#define SQLITE_ENABLE_COLUMN_METADATA 1'
+              echo '#define SQLITE_LIKE_DOESNT_MATCH_BLOBS 1'
+              echo '#define SQLITE_DEFAULT_MEMSTATUS 0'
+              echo '#define SQLITE_THREADSAFE 2'
+              echo '#define SQLITE_OMIT_DEPRECATED 1'
+              echo '#define SQLITE_ENABLE_NAN_INF 1'
+              cat "$f"
+            } > "$tmp"
+            mv "$tmp" "$f"
           fi
-          head -n 10 sqlite-src/out/sqlite3.c
+      
+          head -n 12 "$f"
+
 
       - name: Upload amalgamation artifact (incl. pinned SHA)
         uses: actions/upload-artifact@v4
