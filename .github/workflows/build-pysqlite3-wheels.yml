@@ -7,35 +7,21 @@ on:
       - wheels-*
 
 env:
-  # Which SQLite branch to build:
-  # - "wal2" tracks WAL2 tip; for determinism, pin to a wal2-* sub-branch or a specific SHA.
-  # - "trunk" if you do not want WAL2.
+  # WAL2 source to build from. Use a specific SHA or keep "wal2" to follow the branch tip.
   SQLITE_WAL2_BRANCH: "wal2"
 
-  # POSIX-style defines (also injected via defines.h to make flags deterministic)
-  POSIX_SQLITE_DEFINES: >-
-    -DSQLITE_ENABLE_JSON1=1
-    -DSQLITE_ENABLE_FTS5=1
-    -DSQLITE_ENABLE_RTREE=1
-    -DSQLITE_ENABLE_STAT4=1
-    -DSQLITE_ENABLE_MATH_FUNCTIONS=1
-    -DSQLITE_ENABLE_NORMALIZE=1
-    -DSQLITE_ENABLE_DESERIALIZE=1
-    -DSQLITE_ENABLE_DBPAGE_VTAB=1
-    -DSQLITE_ENABLE_DBSTAT_VTAB=1
-    -DSQLITE_ENABLE_STMTVTAB=1
-    -DSQLITE_ENABLE_COLUMN_METADATA=1
-    -DSQLITE_LIKE_DOESNT_MATCH_BLOBS=1
-    -DSQLITE_DEFAULT_MEMSTATUS=0
-    -DSQLITE_THREADSAFE=2
-    -DSQLITE_OMIT_DEPRECATED=1
-    -DSQLITE_ENABLE_NAN_INF=1
+  # Bump this if you change the flag set below — it invalidates the prep cache.
+  FLAGS_REV: "v1"
 
+  # Version of coleifer/pysqlite3 to build wheels for.
   PYSQLITE3_VERSION: "0.5.4"
+
+  # Mild optimization flags for POSIX builds (feature flags are injected in the amalgamation itself).
+  POSIX_BASE_CFLAGS: "-O3 -fPIC -DNDEBUG"
 
 jobs:
   prep-sqlite-amalgamation:
-    name: Prepare SQLite WAL2 amalgamation (cached by SHA)
+    name: Prepare SQLite WAL2 amalgamation (cached by SHA + flags rev)
     runs-on: ubuntu-latest
     steps:
       - name: Install prerequisites
@@ -44,6 +30,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y fossil tcl build-essential
 
+      # Resolve an exact WAL2 commit SHA so cache/artifact are deterministic
       - name: Resolve WAL2 SHA
         id: wal2
         run: |
@@ -56,13 +43,15 @@ jobs:
           WAL2_SHA=$(fossil info | awk '/^checkout:/ {print $2}')
           echo "sha=$WAL2_SHA" >> "$GITHUB_OUTPUT"
 
+      # Cache the built amalgamation by (WAL2 SHA + flags rev)
       - name: Restore amalgamation cache
         id: cache-amalg
         uses: actions/cache@v4
         with:
           path: sqlite-src/out
-          key: sqlite-wal2-${{ steps.wal2.outputs.sha }}
+          key: sqlite-wal2-${{ steps.wal2.outputs.sha }}-${{ env.FLAGS_REV }}
 
+      # Build amalgamation when cache is cold
       - name: Configure & build amalgamation (sqlite3.c / sqlite3.h)
         if: steps.cache-amalg.outputs.cache-hit != 'true'
         run: |
@@ -75,6 +64,36 @@ jobs:
           mkdir -p ../out
           cp sqlite3.c sqlite3.h sqlite3ext.h ../out/
           echo "${{ steps.wal2.outputs.sha }}" > ../out/WAL2_SHA.txt
+
+      # Inject feature flags into the artifact's sqlite3.c so all platforms compile with them
+      - name: Inject compile flags into amalgamation (prepend to sqlite3.c)
+        run: |
+          set -euxo pipefail
+          test -f sqlite-src/out/sqlite3.c
+          if ! grep -q 'SQLITE_ENABLE_NAN_INF' sqlite-src/out/sqlite3.c; then
+            cat > sqlite-src/out/defines.pre.h <<'EOF'
+#define NDEBUG 1
+#define SQLITE_ENABLE_JSON1 1
+#define SQLITE_ENABLE_FTS5 1
+#define SQLITE_ENABLE_RTREE 1
+#define SQLITE_ENABLE_STAT4 1
+#define SQLITE_ENABLE_MATH_FUNCTIONS 1
+#define SQLITE_ENABLE_NORMALIZE 1
+#define SQLITE_ENABLE_DESERIALIZE 1
+#define SQLITE_ENABLE_DBPAGE_VTAB 1
+#define SQLITE_ENABLE_DBSTAT_VTAB 1
+#define SQLITE_ENABLE_STMTVTAB 1
+#define SQLITE_ENABLE_COLUMN_METADATA 1
+#define SQLITE_LIKE_DOESNT_MATCH_BLOBS 1
+#define SQLITE_DEFAULT_MEMSTATUS 0
+#define SQLITE_THREADSAFE 2
+#define SQLITE_OMIT_DEPRECATED 1
+#define SQLITE_ENABLE_NAN_INF 1
+EOF
+            cat sqlite-src/out/defines.pre.h sqlite-src/out/sqlite3.c > sqlite-src/out/sqlite3.c.new
+            mv sqlite-src/out/sqlite3.c.new sqlite-src/out/sqlite3.c
+          fi
+          head -n 10 sqlite-src/out/sqlite3.c
 
       - name: Upload amalgamation artifact (incl. pinned SHA)
         uses: actions/upload-artifact@v4
@@ -89,72 +108,44 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/cache@v4
         with:
           path: ~/.cache/pip
           key: pip-${{ runner.os }}-${{ hashFiles('**/pyproject.toml', '**/setup.cfg') }}
-
       - uses: actions/cache@v4
         with:
           path: ~/.cache/cibuildwheel
           key: cibw-${{ runner.os }}
-
       - uses: actions/download-artifact@v4
         with:
           name: sqlite-wal2-amalgamation
           path: amalgamation
-
-      - name: Clone pysqlite3 and vendor amalgamation (prepend defines.h)
+      - name: Clone pysqlite3 and vendor amalgamation
         run: |
           set -euxo pipefail
           git clone --depth 1 --branch "${PYSQLITE3_VERSION}" https://github.com/coleifer/pysqlite3.git pysqlite3-src
           cp amalgamation/sqlite3.c pysqlite3-src/
           cp amalgamation/sqlite3.h pysqlite3-src/
           cp amalgamation/sqlite3ext.h pysqlite3-src/
-          cat > pysqlite3-src/defines.h <<'EOF'
-          #define SQLITE_ENABLE_JSON1 1
-          #define SQLITE_ENABLE_FTS5 1
-          #define SQLITE_ENABLE_RTREE 1
-          #define SQLITE_ENABLE_STAT4 1
-          #define SQLITE_ENABLE_MATH_FUNCTIONS 1
-          #define SQLITE_ENABLE_NORMALIZE 1
-          #define SQLITE_ENABLE_DESERIALIZE 1
-          #define SQLITE_ENABLE_DBPAGE_VTAB 1
-          #define SQLITE_ENABLE_DBSTAT_VTAB 1
-          #define SQLITE_ENABLE_STMTVTAB 1
-          #define SQLITE_ENABLE_COLUMN_METADATA 1
-          #define SQLITE_LIKE_DOESNT_MATCH_BLOBS 1
-          #define SQLITE_DEFAULT_MEMSTATUS 0
-          #define SQLITE_THREADSAFE 2
-          #define SQLITE_OMIT_DEPRECATED 1
-          #define SQLITE_ENABLE_NAN_INF 1
-          EOF
-          { printf '#include "defines.h"\n'; cat pysqlite3-src/sqlite3.c; } > pysqlite3-src/sqlite3.c.new
-          mv pysqlite3-src/sqlite3.c.new pysqlite3-src/sqlite3.c
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
       - run: python -m pip install -U pip cibuildwheel==2.*
-
       - name: Build wheels
         env:
           CIBW_BUILD: "cp39-manylinux_* cp310-manylinux_* cp311-manylinux_* cp312-manylinux_*"
           CIBW_ARCHS_LINUX: "x86_64"
           CIBW_BEFORE_BUILD: "python -m pip install -U setuptools wheel && cd {package} && python setup.py build_static"
-          CIBW_ENVIRONMENT_LINUX: 'CFLAGS="-O3 -fPIC -DNDEBUG ${{ env.POSIX_SQLITE_DEFINES }}" CPPFLAGS="$CFLAGS"'
+          CIBW_ENVIRONMENT_LINUX: 'CFLAGS="${{ env.POSIX_BASE_CFLAGS }}" CPPFLAGS="$CFLAGS"'
           CIBW_BUILD_VERBOSITY: "1"
         run: python -m cibuildwheel pysqlite3-src --output-dir wheelhouse
-
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-linux-manylinux-x86_64
           path: wheelhouse/*.whl
 
   linux-manylinux-aarch64:
-    name: Linux manylinux wheels (cp39–cp312, aarch64 native)
+    name: Linux manylinux wheels (cp39–cp312, aarch64 • native)
     needs: prep-sqlite-amalgamation
     runs-on: ubuntu-24.04-arm
     steps:
@@ -171,33 +162,13 @@ jobs:
         with:
           name: sqlite-wal2-amalgamation
           path: amalgamation
-      - name: Clone pysqlite3 and vendor amalgamation (prepend defines.h)
+      - name: Clone pysqlite3 and vendor amalgamation
         run: |
           set -euxo pipefail
           git clone --depth 1 --branch "${PYSQLITE3_VERSION}" https://github.com/coleifer/pysqlite3.git pysqlite3-src
           cp amalgamation/sqlite3.c pysqlite3-src/
           cp amalgamation/sqlite3.h pysqlite3-src/
           cp amalgamation/sqlite3ext.h pysqlite3-src/
-          cat > pysqlite3-src/defines.h <<'EOF'
-          #define SQLITE_ENABLE_JSON1 1
-          #define SQLITE_ENABLE_FTS5 1
-          #define SQLITE_ENABLE_RTREE 1
-          #define SQLITE_ENABLE_STAT4 1
-          #define SQLITE_ENABLE_MATH_FUNCTIONS 1
-          #define SQLITE_ENABLE_NORMALIZE 1
-          #define SQLITE_ENABLE_DESERIALIZE 1
-          #define SQLITE_ENABLE_DBPAGE_VTAB 1
-          #define SQLITE_ENABLE_DBSTAT_VTAB 1
-          #define SQLITE_ENABLE_STMTVTAB 1
-          #define SQLITE_ENABLE_COLUMN_METADATA 1
-          #define SQLITE_LIKE_DOESNT_MATCH_BLOBS 1
-          #define SQLITE_DEFAULT_MEMSTATUS 0
-          #define SQLITE_THREADSAFE 2
-          #define SQLITE_OMIT_DEPRECATED 1
-          #define SQLITE_ENABLE_NAN_INF 1
-          EOF
-          { printf '#include "defines.h"\n'; cat pysqlite3-src/sqlite3.c; } > pysqlite3-src/sqlite3.c.new
-          mv pysqlite3-src/sqlite3.c.new pysqlite3-src/sqlite3.c
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -207,7 +178,7 @@ jobs:
           CIBW_BUILD: "cp39-manylinux_* cp310-manylinux_* cp311-manylinux_* cp312-manylinux_*"
           CIBW_ARCHS_LINUX: "aarch64"
           CIBW_BEFORE_BUILD: "python -m pip install -U setuptools wheel && cd {package} && python setup.py build_static"
-          CIBW_ENVIRONMENT_LINUX: 'CFLAGS="-O3 -fPIC -DNDEBUG ${{ env.POSIX_SQLITE_DEFINES }}" CPPFLAGS="$CFLAGS"'
+          CIBW_ENVIRONMENT_LINUX: 'CFLAGS="${{ env.POSIX_BASE_CFLAGS }}" CPPFLAGS="$CFLAGS"'
           CIBW_BUILD_VERBOSITY: "1"
         run: python -m cibuildwheel pysqlite3-src --output-dir wheelhouse
       - uses: actions/upload-artifact@v4
@@ -234,33 +205,13 @@ jobs:
         with:
           name: sqlite-wal2-amalgamation
           path: amalgamation
-      - name: Clone pysqlite3 and vendor amalgamation (prepend defines.h)
+      - name: Clone pysqlite3 and vendor amalgamation
         run: |
           set -euxo pipefail
           git clone --depth 1 --branch "${PYSQLITE3_VERSION}" https://github.com/coleifer/pysqlite3.git pysqlite3-src
           cp amalgamation/sqlite3.c pysqlite3-src/
           cp amalgamation/sqlite3.h pysqlite3-src/
           cp amalgamation/sqlite3ext.h pysqlite3-src/
-          cat > pysqlite3-src/defines.h <<'EOF'
-          #define SQLITE_ENABLE_JSON1 1
-          #define SQLITE_ENABLE_FTS5 1
-          #define SQLITE_ENABLE_RTREE 1
-          #define SQLITE_ENABLE_STAT4 1
-          #define SQLITE_ENABLE_MATH_FUNCTIONS 1
-          #define SQLITE_ENABLE_NORMALIZE 1
-          #define SQLITE_ENABLE_DESERIALIZE 1
-          #define SQLITE_ENABLE_DBPAGE_VTAB 1
-          #define SQLITE_ENABLE_DBSTAT_VTAB 1
-          #define SQLITE_ENABLE_STMTVTAB 1
-          #define SQLITE_ENABLE_COLUMN_METADATA 1
-          #define SQLITE_LIKE_DOESNT_MATCH_BLOBS 1
-          #define SQLITE_DEFAULT_MEMSTATUS 0
-          #define SQLITE_THREADSAFE 2
-          #define SQLITE_OMIT_DEPRECATED 1
-          #define SQLITE_ENABLE_NAN_INF 1
-          EOF
-          { printf '#include "defines.h"\n'; cat pysqlite3-src/sqlite3.c; } > pysqlite3-src/sqlite3.c.new
-          mv pysqlite3-src/sqlite3.c.new pysqlite3-src/sqlite3.c
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -270,7 +221,7 @@ jobs:
           CIBW_BUILD: "cp39-musllinux_* cp310-musllinux_* cp311-musllinux_* cp312-musllinux_*"
           CIBW_ARCHS_LINUX: "x86_64"
           CIBW_BEFORE_BUILD: "python -m pip install -U setuptools wheel && cd {package} && python setup.py build_static"
-          CIBW_ENVIRONMENT_LINUX: 'CFLAGS="-O3 -fPIC -DNDEBUG ${{ env.POSIX_SQLITE_DEFINES }}" CPPFLAGS="$CFLAGS"'
+          CIBW_ENVIRONMENT_LINUX: 'CFLAGS="${{ env.POSIX_BASE_CFLAGS }}" CPPFLAGS="$CFLAGS"'
           CIBW_BUILD_VERBOSITY: "1"
         run: python -m cibuildwheel pysqlite3-src --output-dir wheelhouse
       - uses: actions/upload-artifact@v4
@@ -279,7 +230,7 @@ jobs:
           path: wheelhouse/*.whl
 
   linux-musllinux-aarch64:
-    name: Linux musllinux wheels (cp39–cp312, aarch64 native)
+    name: Linux musllinux wheels (cp39–cp312, aarch64 • native)
     needs: prep-sqlite-amalgamation
     runs-on: ubuntu-24.04-arm
     steps:
@@ -296,33 +247,13 @@ jobs:
         with:
           name: sqlite-wal2-amalgamation
           path: amalgamation
-      - name: Clone pysqlite3 and vendor amalgamation (prepend defines.h)
+      - name: Clone pysqlite3 and vendor amalgamation
         run: |
           set -euxo pipefail
           git clone --depth 1 --branch "${PYSQLITE3_VERSION}" https://github.com/coleifer/pysqlite3.git pysqlite3-src
           cp amalgamation/sqlite3.c pysqlite3-src/
           cp amalgamation/sqlite3.h pysqlite3-src/
           cp amalgamation/sqlite3ext.h pysqlite3-src/
-          cat > pysqlite3-src/defines.h <<'EOF'
-          #define SQLITE_ENABLE_JSON1 1
-          #define SQLITE_ENABLE_FTS5 1
-          #define SQLITE_ENABLE_RTREE 1
-          #define SQLITE_ENABLE_STAT4 1
-          #define SQLITE_ENABLE_MATH_FUNCTIONS 1
-          #define SQLITE_ENABLE_NORMALIZE 1
-          #define SQLITE_ENABLE_DESERIALIZE 1
-          #define SQLITE_ENABLE_DBPAGE_VTAB 1
-          #define SQLITE_ENABLE_DBSTAT_VTAB 1
-          #define SQLITE_ENABLE_STMTVTAB 1
-          #define SQLITE_ENABLE_COLUMN_METADATA 1
-          #define SQLITE_LIKE_DOESNT_MATCH_BLOBS 1
-          #define SQLITE_DEFAULT_MEMSTATUS 0
-          #define SQLITE_THREADSAFE 2
-          #define SQLITE_OMIT_DEPRECATED 1
-          #define SQLITE_ENABLE_NAN_INF 1
-          EOF
-          { printf '#include "defines.h"\n'; cat pysqlite3-src/sqlite3.c; } > pysqlite3-src/sqlite3.c.new
-          mv pysqlite3-src/sqlite3.c.new pysqlite3-src/sqlite3.c
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -332,7 +263,7 @@ jobs:
           CIBW_BUILD: "cp39-musllinux_* cp310-musllinux_* cp311-musllinux_* cp312-musllinux_*"
           CIBW_ARCHS_LINUX: "aarch64"
           CIBW_BEFORE_BUILD: "python -m pip install -U setuptools wheel && cd {package} && python setup.py build_static"
-          CIBW_ENVIRONMENT_LINUX: 'CFLAGS="-O3 -fPIC -DNDEBUG ${{ env.POSIX_SQLITE_DEFINES }}" CPPFLAGS="$CFLAGS"'
+          CIBW_ENVIRONMENT_LINUX: 'CFLAGS="${{ env.POSIX_BASE_CFLAGS }}" CPPFLAGS="$CFLAGS"'
           CIBW_BUILD_VERBOSITY: "1"
         run: python -m cibuildwheel pysqlite3-src --output-dir wheelhouse
       - uses: actions/upload-artifact@v4
@@ -351,34 +282,13 @@ jobs:
         with:
           name: sqlite-wal2-amalgamation
           path: amalgamation
-      - name: Clone pysqlite3 and vendor amalgamation (prepend defines.h)
+      - name: Clone pysqlite3 and vendor amalgamation
         run: |
           set -euxo pipefail
           git clone --depth 1 --branch "${PYSQLITE3_VERSION}" https://github.com/coleifer/pysqlite3.git pysqlite3-src
           cp amalgamation/sqlite3.c pysqlite3-src/
           cp amalgamation/sqlite3.h pysqlite3-src/
           cp amalgamation/sqlite3ext.h pysqlite3-src/
-          (cat <<'EOF'
-          #define SQLITE_ENABLE_JSON1 1
-          #define SQLITE_ENABLE_FTS5 1
-          #define SQLITE_ENABLE_RTREE 1
-          #define SQLITE_ENABLE_STAT4 1
-          #define SQLITE_ENABLE_MATH_FUNCTIONS 1
-          #define SQLITE_ENABLE_NORMALIZE 1
-          #define SQLITE_ENABLE_DESERIALIZE 1
-          #define SQLITE_ENABLE_DBPAGE_VTAB 1
-          #define SQLITE_ENABLE_DBSTAT_VTAB 1
-          #define SQLITE_ENABLE_STMTVTAB 1
-          #define SQLITE_ENABLE_COLUMN_METADATA 1
-          #define SQLITE_LIKE_DOESNT_MATCH_BLOBS 1
-          #define SQLITE_DEFAULT_MEMSTATUS 0
-          #define SQLITE_THREADSAFE 2
-          #define SQLITE_OMIT_DEPRECATED 1
-          #define SQLITE_ENABLE_NAN_INF 1
-          EOF
-          ) > pysqlite3-src/defines.h
-          (printf '#include "defines.h"\n'; cat pysqlite3-src/sqlite3.c) > pysqlite3-src/sqlite3.c.new
-          mv pysqlite3-src/sqlite3.c.new pysqlite3-src/sqlite3.c
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -388,7 +298,7 @@ jobs:
           CIBW_BUILD: "cp39-macosx_* cp310-macosx_* cp311-macosx_* cp312-macosx_*"
           CIBW_ARCHS_MACOS: "x86_64"
           CIBW_BEFORE_BUILD: "python -m pip install -U setuptools wheel && cd {package} && python setup.py build_static"
-          CIBW_ENVIRONMENT_MACOS: 'MACOSX_DEPLOYMENT_TARGET=10.13 CFLAGS="-O3 -fPIC -DNDEBUG ${{ env.POSIX_SQLITE_DEFINES }}" CPPFLAGS="$CFLAGS"'
+          CIBW_ENVIRONMENT_MACOS: 'MACOSX_DEPLOYMENT_TARGET=10.9 CFLAGS="${{ env.POSIX_BASE_CFLAGS }}" CPPFLAGS="$CFLAGS"'
           CIBW_BUILD_VERBOSITY: "1"
         run: python -m cibuildwheel pysqlite3-src --output-dir wheelhouse
       - uses: actions/upload-artifact@v4
@@ -406,34 +316,13 @@ jobs:
         with:
           name: sqlite-wal2-amalgamation
           path: amalgamation
-      - name: Clone pysqlite3 and vendor amalgamation (prepend defines.h)
+      - name: Clone pysqlite3 and vendor amalgamation
         run: |
           set -euxo pipefail
           git clone --depth 1 --branch "${PYSQLITE3_VERSION}" https://github.com/coleifer/pysqlite3.git pysqlite3-src
           cp amalgamation/sqlite3.c pysqlite3-src/
           cp amalgamation/sqlite3.h pysqlite3-src/
           cp amalgamation/sqlite3ext.h pysqlite3-src/
-          (cat <<'EOF'
-          #define SQLITE_ENABLE_JSON1 1
-          #define SQLITE_ENABLE_FTS5 1
-          #define SQLITE_ENABLE_RTREE 1
-          #define SQLITE_ENABLE_STAT4 1
-          #define SQLITE_ENABLE_MATH_FUNCTIONS 1
-          #define SQLITE_ENABLE_NORMALIZE 1
-          #define SQLITE_ENABLE_DESERIALIZE 1
-          #define SQLITE_ENABLE_DBPAGE_VTAB 1
-          #define SQLITE_ENABLE_DBSTAT_VTAB 1
-          #define SQLITE_ENABLE_STMTVTAB 1
-          #define SQLITE_ENABLE_COLUMN_METADATA 1
-          #define SQLITE_LIKE_DOESNT_MATCH_BLOBS 1
-          #define SQLITE_DEFAULT_MEMSTATUS 0
-          #define SQLITE_THREADSAFE 2
-          #define SQLITE_OMIT_DEPRECATED 1
-          #define SQLITE_ENABLE_NAN_INF 1
-          EOF
-          ) > pysqlite3-src/defines.h
-          (printf '#include "defines.h"\n'; cat pysqlite3-src/sqlite3.c) > pysqlite3-src/sqlite3.c.new
-          mv pysqlite3-src/sqlite3.c.new pysqlite3-src/sqlite3.c
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -443,7 +332,7 @@ jobs:
           CIBW_BUILD: "cp39-macosx_* cp310-macosx_* cp311-macosx_* cp312-macosx_*"
           CIBW_ARCHS_MACOS: "arm64"
           CIBW_BEFORE_BUILD: "python -m pip install -U setuptools wheel && cd {package} && python setup.py build_static"
-          CIBW_ENVIRONMENT_MACOS: 'MACOSX_DEPLOYMENT_TARGET=11.0 CFLAGS="-O3 -fPIC -DNDEBUG ${{ env.POSIX_SQLITE_DEFINES }}" CPPFLAGS="$CFLAGS"'
+          CIBW_ENVIRONMENT_MACOS: 'MACOSX_DEPLOYMENT_TARGET=11.0 CFLAGS="${{ env.POSIX_BASE_CFLAGS }}" CPPFLAGS="$CFLAGS"'
           CIBW_BUILD_VERBOSITY: "1"
         run: python -m cibuildwheel pysqlite3-src --output-dir wheelhouse
       - uses: actions/upload-artifact@v4
@@ -462,52 +351,24 @@ jobs:
         with:
           name: sqlite-wal2-amalgamation
           path: amalgamation
-      - name: Clone pysqlite3 and vendor amalgamation (prepend defines.h)
+      - name: Clone pysqlite3 and vendor amalgamation
         shell: pwsh
         run: |
           git clone --depth 1 --branch $env:PYSQLITE3_VERSION https://github.com/coleifer/pysqlite3.git pysqlite3-src
           Copy-Item amalgamation\sqlite3.c pysqlite3-src\
           Copy-Item amalgamation\sqlite3.h pysqlite3-src\
           Copy-Item amalgamation\sqlite3ext.h pysqlite3-src\
-          $defs = @'
-          #define SQLITE_ENABLE_JSON1 1
-          #define SQLITE_ENABLE_FTS5 1
-          #define SQLITE_ENABLE_RTREE 1
-          #define SQLITE_ENABLE_STAT4 1
-          #define SQLITE_ENABLE_MATH_FUNCTIONS 1
-          #define SQLITE_ENABLE_NORMALIZE 1
-          #define SQLITE_ENABLE_DESERIALIZE 1
-          #define SQLITE_ENABLE_DBPAGE_VTAB 1
-          #define SQLITE_ENABLE_DBSTAT_VTAB 1
-          #define SQLITE_ENABLE_STMTVTAB 1
-          #define SQLITE_ENABLE_COLUMN_METADATA 1
-          #define SQLITE_LIKE_DOESNT_MATCH_BLOBS 1
-          #define SQLITE_DEFAULT_MEMSTATUS 0
-          #define SQLITE_THREADSAFE 2
-          #define SQLITE_OMIT_DEPRECATED 1
-          #define SQLITE_ENABLE_NAN_INF 1
-          '@
-          Set-Content -Path "pysqlite3-src\defines.h" -Value $defs -NoNewline
-          $p = "pysqlite3-src\sqlite3.c"
-          $orig = Get-Content $p -Raw
-          '#include "defines.h"' + "`r`n" + $orig | Set-Content $p -NoNewline
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
       - run: python -m pip install -U pip cibuildwheel==2.*
-
       - name: Build wheels
         env:
           CIBW_BUILD: "cp39-win_amd64 cp310-win_amd64 cp311-win_amd64 cp312-win_amd64"
           CIBW_ARCHS_WINDOWS: "AMD64"
           CIBW_BEFORE_BUILD_WINDOWS: "python -m pip install -U setuptools wheel && cd {package} && python setup.py build_static"
-          # No inner quotes so MSVC sees all /D flags (redundant with defines.h but harmless)
-          CIBW_ENVIRONMENT_WINDOWS: 'CL="/O2 /DNDEBUG /DSQLITE_ENABLE_JSON1 /DSQLITE_ENABLE_FTS5 /DSQLITE_ENABLE_RTREE /DSQLITE_ENABLE_STAT4 /DSQLITE_ENABLE_MATH_FUNCTIONS /DSQLITE_ENABLE_NORMALIZE /DSQLITE_ENABLE_DESERIALIZE /DSQLITE_ENABLE_DBPAGE_VTAB /DSQLITE_ENABLE_DBSTAT_VTAB /DSQLITE_ENABLE_STMTVTAB /DSQLITE_ENABLE_COLUMN_METADATA /DSQLITE_LIKE_DOESNT_MATCH_BLOBS /DSQLITE_DEFAULT_MEMSTATUS=0 /DSQLITE_THREADSAFE=2 /DSQLITE_OMIT_DEPRECATED /DSQLITE_ENABLE_NAN_INF"'
           CIBW_BUILD_VERBOSITY: "1"
         run: python -m cibuildwheel pysqlite3-src --output-dir wheelhouse
-
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-windows-amd64
