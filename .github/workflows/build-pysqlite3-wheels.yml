@@ -27,6 +27,7 @@ env:
     -DSQLITE_ENABLE_NAN_INF=1
 
 jobs:
+  # Build & upload a FLAT amalgamation artifact (sqlite3.c/.h/.ext.h + pinned SHA)
   prep-sqlite-amalgamation:
     name: Prepare SQLite WAL2 amalgamation
     runs-on: ubuntu-latest
@@ -53,15 +54,20 @@ jobs:
           ./configure
           make sqlite3.c sqlite3.h
           cp tsrc/sqlite3ext.h . || cp src/sqlite3ext.h .
-      - name: Upload amalgamation
+      - name: Stage files for upload (flatten)
+        run: |
+          set -euxo pipefail
+          mkdir -p out
+          cp sqlite-src/repo/sqlite3.c out/
+          cp sqlite-src/repo/sqlite3.h out/
+          cp sqlite-src/repo/sqlite3ext.h out/
+          cp sqlite-src/WAL2_SHA.txt out/
+          ls -l out
+      - name: Upload amalgamation artifact
         uses: actions/upload-artifact@v4
         with:
           name: sqlite-wal2-amalgamation
-          path: |
-            sqlite-src/repo/sqlite3.c
-            sqlite-src/repo/sqlite3.h
-            sqlite-src/repo/sqlite3ext.h
-            sqlite-src/WAL2_SHA.txt
+          path: out/*
 
   # -------- Linux manylinux x86_64 --------
   linux-manylinux-x86_64:
@@ -72,9 +78,18 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with: { name: sqlite-wal2-amalgamation, path: amalgamation }
+      - name: Verify amalgamation files
+        run: ls -l amalgamation
       - name: Clone pysqlite3 & drop in amalgamation
         run: |
+          set -euxo pipefail
           git clone --depth 1 --branch "${PYSQLITE3_REF}" "${PYSQLITE3_REPO}" pysqlite3-src
+          # Put files where setup looks for "amalgamation/"
+          mkdir -p pysqlite3-src/amalgamation
+          cp amalgamation/sqlite3.c pysqlite3-src/amalgamation/
+          cp amalgamation/sqlite3.h pysqlite3-src/amalgamation/
+          cp amalgamation/sqlite3ext.h pysqlite3-src/amalgamation/
+          # Also copy to root as a belt-and-suspenders (some builds check here)
           cp amalgamation/sqlite3.c pysqlite3-src/
           cp amalgamation/sqlite3.h pysqlite3-src/
           cp amalgamation/sqlite3ext.h pysqlite3-src/
@@ -83,27 +98,49 @@ jobs:
       - run: python -m pip install -U pip cibuildwheel==2.*
       - name: Build wheels
         env:
-          # Trim to the Python versions you actually need to speed things up
           CIBW_BUILD: "cp39-manylinux_* cp310-manylinux_* cp311-manylinux_* cp312-manylinux_*"
           CIBW_ARCHS_LINUX: "x86_64"
-          CIBW_ENVIRONMENT_LINUX: 'CFLAGS="-O2 -pipe -fPIC -DNDEBUG ${{ env.POSIX_SQLITE_DEFINES }}"'
+          CIBW_ENVIRONMENT_LINUX: >-
+            CFLAGS="-O2 -pipe -fPIC -DNDEBUG ${{ env.POSIX_SQLITE_DEFINES }}"
+            PYSQLITE3_USE_AMALGAMATION=1
           CIBW_BUILD_VERBOSITY: "1"
         run: python -m cibuildwheel pysqlite3-src --output-dir wheelhouse
+      - name: Smoke test one wheel
+        run: |
+          set -euxo pipefail
+          pyver=$(python -c 'import sys;print(f"cp{sys.version_info.major}{sys.version_info.minor}")')
+          whl=$(ls wheelhouse/pysqlite3-*${pyver}-manylinux*.whl | head -n1)
+          python -m venv v && . v/bin/activate
+          pip install "$whl"
+          python - <<'PY'
+          import pysqlite3 as sqlite3
+          con=sqlite3.connect(":memory:")
+          ok = con.execute("SELECT sqlite_compileoption_used('ENABLE_NAN_INF')").fetchone()[0]==1
+          assert ok, "SQLite not built with ENABLE_NAN_INF"
+          print("OK: ENABLE_NAN_INF present")
+          PY
       - uses: actions/upload-artifact@v4
         with: { name: wheels-pysqlite3-manylinux-x86_64, path: wheelhouse/*.whl }
 
-  # -------- Linux manylinux aarch64 (NATIVE, fast) --------
+  # -------- Linux manylinux aarch64 (NATIVE ARM, no QEMU) --------
   linux-manylinux-aarch64:
     name: manylinux (aarch64 native)
     needs: prep-sqlite-amalgamation
-    runs-on: ubuntu-24.04-arm   # Use native arm64 runner to avoid QEMU
+    runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with: { name: sqlite-wal2-amalgamation, path: amalgamation }
+      - name: Verify amalgamation files
+        run: ls -l amalgamation
       - name: Clone pysqlite3 & drop in amalgamation
         run: |
+          set -euxo pipefail
           git clone --depth 1 --branch "${PYSQLITE3_REF}" "${PYSQLITE3_REPO}" pysqlite3-src
+          mkdir -p pysqlite3-src/amalgamation
+          cp amalgamation/sqlite3.c pysqlite3-src/amalgamation/
+          cp amalgamation/sqlite3.h pysqlite3-src/amalgamation/
+          cp amalgamation/sqlite3ext.h pysqlite3-src/amalgamation/
           cp amalgamation/sqlite3.c pysqlite3-src/
           cp amalgamation/sqlite3.h pysqlite3-src/
           cp amalgamation/sqlite3ext.h pysqlite3-src/
@@ -114,42 +151,29 @@ jobs:
         env:
           CIBW_BUILD: "cp39-manylinux_* cp310-manylinux_* cp311-manylinux_* cp312-manylinux_*"
           CIBW_ARCHS_LINUX: "aarch64"
-          CIBW_ENVIRONMENT_LINUX: 'CFLAGS="-O2 -pipe -fPIC -DNDEBUG ${{ env.POSIX_SQLITE_DEFINES }}"'
+          CIBW_ENVIRONMENT_LINUX: >-
+            CFLAGS="-O2 -pipe -fPIC -DNDEBUG ${{ env.POSIX_SQLITE_DEFINES }}"
+            PYSQLITE3_USE_AMALGAMATION=1
           CIBW_BUILD_VERBOSITY: "1"
         run: python -m cibuildwheel pysqlite3-src --output-dir wheelhouse
+      - name: Smoke test one wheel
+        run: |
+          set -euxo pipefail
+          pyver=$(python -c 'import sys;print(f"cp{sys.version_info.major}{sys.version_info.minor}")')
+          whl=$(ls wheelhouse/pysqlite3-*${pyver}-manylinux*aarch64.whl | head -n1)
+          python -m venv v && . v/bin/activate
+          pip install "$whl"
+          python - <<'PY'
+          import pysqlite3 as sqlite3
+          con=sqlite3.connect(":memory:")
+          ok = con.execute("SELECT sqlite_compileoption_used('ENABLE_NAN_INF')").fetchone()[0]==1
+          assert ok, "SQLite not built with ENABLE_NAN_INF"
+          print("OK: ENABLE_NAN_INF present")
+          PY
       - uses: actions/upload-artifact@v4
         with: { name: wheels-pysqlite3-manylinux-aarch64, path: wheelhouse/*.whl }
 
-  # If you don't have native arm runners, uncomment this QEMU fallback (slower):
-  # linux-manylinux-aarch64-qemu:
-  #   name: manylinux (aarch64 via QEMU)
-  #   needs: prep-sqlite-amalgamation
-  #   runs-on: ubuntu-latest
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #     - uses: actions/download-artifact@v4
-  #       with: { name: sqlite-wal2-amalgamation, path: amalgamation }
-  #     - name: Clone pysqlite3 & drop in amalgamation
-  #       run: |
-  #         git clone --depth 1 --branch "${PYSQLITE3_REF}" "${PYSQLITE3_REPO}" pysqlite3-src
-  #         cp amalgamation/sqlite3.c pysqlite3-src/
-  #         cp amalgamation/sqlite3.h pysqlite3-src/
-  #         cp amalgamation/sqlite3ext.h pysqlite3-src/
-  #     - uses: actions/setup-python@v5
-  #       with: { python-version: "3.12" }
-  #     - run: python -m pip install -U pip cibuildwheel==2.*
-  #     - uses: docker/setup-qemu-action@v3
-  #       with: { platforms: arm64 }
-  #     - name: Build wheels
-  #       env:
-  #         CIBW_BUILD: "cp39-manylinux_* cp310-manylinux_* cp311-manylinux_* cp312-manylinux_*"
-  #         CIBW_ARCHS_LINUX: "aarch64"
-  #         CIBW_ENVIRONMENT_LINUX: 'CFLAGS="-O2 -pipe -fPIC -DNDEBUG ${{ env.POSIX_SQLITE_DEFINES }}"'
-  #       run: python -m cibuildwheel pysqlite3-src --output-dir wheelhouse
-  #     - uses: actions/upload-artifact@v4
-  #       with: { name: wheels-pysqlite3-manylinux-aarch64, path: wheelhouse/*.whl }
-
-  # -------- Linux musllinux (if you need Alpine) --------
+  # -------- Linux musllinux (only if you need Alpine) --------
   linux-musllinux-x86_64:
     name: musllinux (x86_64)
     needs: prep-sqlite-amalgamation
@@ -158,9 +182,16 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with: { name: sqlite-wal2-amalgamation, path: amalgamation }
+      - name: Verify amalgamation files
+        run: ls -l amalgamation
       - name: Clone pysqlite3 & drop in amalgamation
         run: |
+          set -euxo pipefail
           git clone --depth 1 --branch "${PYSQLITE3_REF}" "${PYSQLITE3_REPO}" pysqlite3-src
+          mkdir -p pysqlite3-src/amalgamation
+          cp amalgamation/sqlite3.c pysqlite3-src/amalgamation/
+          cp amalgamation/sqlite3.h pysqlite3-src/amalgamation/
+          cp amalgamation/sqlite3ext.h pysqlite3-src/amalgamation/
           cp amalgamation/sqlite3.c pysqlite3-src/
           cp amalgamation/sqlite3.h pysqlite3-src/
           cp amalgamation/sqlite3ext.h pysqlite3-src/
@@ -171,7 +202,9 @@ jobs:
         env:
           CIBW_BUILD: "cp39-musllinux_* cp310-musllinux_* cp311-musllinux_* cp312-musllinux_*"
           CIBW_ARCHS_LINUX: "x86_64"
-          CIBW_ENVIRONMENT_LINUX: 'CFLAGS="-O2 -pipe -fPIC -DNDEBUG ${{ env.POSIX_SQLITE_DEFINES }}"'
+          CIBW_ENVIRONMENT_LINUX: >-
+            CFLAGS="-O2 -pipe -fPIC -DNDEBUG ${{ env.POSIX_SQLITE_DEFINES }}"
+            PYSQLITE3_USE_AMALGAMATION=1
         run: python -m cibuildwheel pysqlite3-src --output-dir wheelhouse
       - uses: actions/upload-artifact@v4
         with: { name: wheels-pysqlite3-musllinux-x86_64, path: wheelhouse/*.whl }
@@ -184,9 +217,16 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with: { name: sqlite-wal2-amalgamation, path: amalgamation }
+      - name: Verify amalgamation files
+        run: ls -l amalgamation
       - name: Clone pysqlite3 & drop in amalgamation
         run: |
+          set -euxo pipefail
           git clone --depth 1 --branch "${PYSQLITE3_REF}" "${PYSQLITE3_REPO}" pysqlite3-src
+          mkdir -p pysqlite3-src/amalgamation
+          cp amalgamation/sqlite3.c pysqlite3-src/amalgamation/
+          cp amalgamation/sqlite3.h pysqlite3-src/amalgamation/
+          cp amalgamation/sqlite3ext.h pysqlite3-src/amalgamation/
           cp amalgamation/sqlite3.c pysqlite3-src/
           cp amalgamation/sqlite3.h pysqlite3-src/
           cp amalgamation/sqlite3ext.h pysqlite3-src/
@@ -197,7 +237,9 @@ jobs:
         env:
           CIBW_BUILD: "cp39-musllinux_* cp310-musllinux_* cp311-musllinux_* cp312-musllinux_*"
           CIBW_ARCHS_LINUX: "aarch64"
-          CIBW_ENVIRONMENT_LINUX: 'CFLAGS="-O2 -pipe -fPIC -DNDEBUG ${{ env.POSIX_SQLITE_DEFINES }}"'
+          CIBW_ENVIRONMENT_LINUX: >-
+            CFLAGS="-O2 -pipe -fPIC -DNDEBUG ${{ env.POSIX_SQLITE_DEFINES }}"
+            PYSQLITE3_USE_AMALGAMATION=1
         run: python -m cibuildwheel pysqlite3-src --output-dir wheelhouse
       - uses: actions/upload-artifact@v4
         with: { name: wheels-pysqlite3-musllinux-aarch64, path: wheelhouse/*.whl }
@@ -211,9 +253,16 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with: { name: sqlite-wal2-amalgamation, path: amalgamation }
+      - name: Verify amalgamation files
+        run: ls -l amalgamation
       - name: Clone pysqlite3 & drop in amalgamation
         run: |
+          set -euxo pipefail
           git clone --depth 1 --branch "${PYSQLITE3_REF}" "${PYSQLITE3_REPO}" pysqlite3-src
+          mkdir -p pysqlite3-src/amalgamation
+          cp amalgamation/sqlite3.c pysqlite3-src/amalgamation/
+          cp amalgamation/sqlite3.h pysqlite3-src/amalgamation/
+          cp amalgamation/sqlite3ext.h pysqlite3-src/amalgamation/
           cp amalgamation/sqlite3.c pysqlite3-src/
           cp amalgamation/sqlite3.h pysqlite3-src/
           cp amalgamation/sqlite3ext.h pysqlite3-src/
@@ -224,7 +273,9 @@ jobs:
         env:
           CIBW_BUILD: "cp39-macosx_* cp310-macosx_* cp311-macosx_* cp312-macosx_*"
           CIBW_ARCHS_MACOS: "x86_64"
-          CIBW_ENVIRONMENT_MACOS: 'CFLAGS="-O2 -pipe -fPIC -DNDEBUG ${{ env.POSIX_SQLITE_DEFINES }}"'
+          CIBW_ENVIRONMENT_MACOS: >-
+            CFLAGS="-O2 -pipe -fPIC -DNDEBUG ${{ env.POSIX_SQLITE_DEFINES }}"
+            PYSQLITE3_USE_AMALGAMATION=1
         run: python -m cibuildwheel pysqlite3-src --output-dir wheelhouse
       - uses: actions/upload-artifact@v4
         with: { name: wheels-pysqlite3-macos-x86_64, path: wheelhouse/*.whl }
@@ -237,9 +288,16 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with: { name: sqlite-wal2-amalgamation, path: amalgamation }
+      - name: Verify amalgamation files
+        run: ls -l amalgamation
       - name: Clone pysqlite3 & drop in amalgamation
         run: |
+          set -euxo pipefail
           git clone --depth 1 --branch "${PYSQLITE3_REF}" "${PYSQLITE3_REPO}" pysqlite3-src
+          mkdir -p pysqlite3-src/amalgamation
+          cp amalgamation/sqlite3.c pysqlite3-src/amalgamation/
+          cp amalgamation/sqlite3.h pysqlite3-src/amalgamation/
+          cp amalgamation/sqlite3ext.h pysqlite3-src/amalgamation/
           cp amalgamation/sqlite3.c pysqlite3-src/
           cp amalgamation/sqlite3.h pysqlite3-src/
           cp amalgamation/sqlite3ext.h pysqlite3-src/
@@ -250,7 +308,9 @@ jobs:
         env:
           CIBW_BUILD: "cp39-macosx_* cp310-macosx_* cp311-macosx_* cp312-macosx_*"
           CIBW_ARCHS_MACOS: "arm64"
-          CIBW_ENVIRONMENT_MACOS: 'CFLAGS="-O2 -pipe -fPIC -DNDEBUG ${{ env.POSIX_SQLITE_DEFINES }}"'
+          CIBW_ENVIRONMENT_MACOS: >-
+            CFLAGS="-O2 -pipe -fPIC -DNDEBUG ${{ env.POSIX_SQLITE_DEFINES }}"
+            PYSQLITE3_USE_AMALGAMATION=1
         run: python -m cibuildwheel pysqlite3-src --output-dir wheelhouse
       - uses: actions/upload-artifact@v4
         with: { name: wheels-pysqlite3-macos-arm64, path: wheelhouse/*.whl }
@@ -264,10 +324,17 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with: { name: sqlite-wal2-amalgamation, path: amalgamation }
+      - name: Verify amalgamation files
+        shell: pwsh
+        run: Get-ChildItem amalgamation
       - name: Clone pysqlite3 & drop in amalgamation
         shell: pwsh
         run: |
           git clone --depth 1 --branch $env:PYSQLITE3_REF $env:PYSQLITE3_REPO pysqlite3-src
+          New-Item -Type Directory -Force pysqlite3-src\amalgamation | Out-Null
+          Copy-Item amalgamation\sqlite3.c pysqlite3-src\amalgamation\
+          Copy-Item amalgamation\sqlite3.h pysqlite3-src\amalgamation\
+          Copy-Item amalgamation\sqlite3ext.h pysqlite3-src\amalgamation\
           Copy-Item amalgamation\sqlite3.c pysqlite3-src\
           Copy-Item amalgamation\sqlite3.h pysqlite3-src\
           Copy-Item amalgamation\sqlite3ext.h pysqlite3-src\
@@ -296,11 +363,13 @@ jobs:
             /DSQLITE_THREADSAFE=2
             /DSQLITE_OMIT_DEPRECATED
             /DSQLITE_ENABLE_NAN_INF"
+            PYSQLITE3_USE_AMALGAMATION=1
           CIBW_BUILD_VERBOSITY: "1"
         run: python -m cibuildwheel pysqlite3-src --output-dir wheelhouse
       - uses: actions/upload-artifact@v4
         with: { name: wheels-pysqlite3-windows-amd64, path: wheelhouse\*.whl }
 
+  # -------- Gather everything --------
   gather:
     name: Gather wheels
     needs:
