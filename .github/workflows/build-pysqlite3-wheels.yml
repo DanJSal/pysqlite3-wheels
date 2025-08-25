@@ -21,8 +21,15 @@ env:
 
 jobs:
   prep-sqlite-amalgamation:
-    name: Prepare SQLite WAL2 amalgamation (cached by SHA + flags rev)
+    name: Prepare SQLite WAL2+trunk(amalgamation) (cached)
     runs-on: ubuntu-latest
+    env:
+      # Optional: set this to a specific trunk check-in (short or full SHA).
+      # Leave empty to use current trunk tip.
+      TRUNK_SHA: "96ec83064"
+
+      # Bump when you change the define set to invalidate cache
+      FLAGS_REV: "v2"
     steps:
       - name: Install prerequisites
         run: |
@@ -30,53 +37,75 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y fossil tcl build-essential
 
-      # Resolve an exact WAL2 commit SHA so cache/artifact are deterministic
-      - name: Resolve WAL2 SHA
-        id: wal2
+      - name: Clone & open SQLite repo
         run: |
           set -euxo pipefail
           mkdir sqlite-src && cd sqlite-src
           fossil clone https://sqlite.org/src sqlite.fossil
           mkdir repo && cd repo
           fossil open ../sqlite.fossil
-          fossil update "${SQLITE_WAL2_BRANCH}"
-          WAL2_SHA=$(fossil info | awk '/^checkout:/ {print $2}')
-          echo "sha=$WAL2_SHA" >> "$GITHUB_OUTPUT"
 
-      # Cache the built amalgamation by (WAL2 SHA + flags rev)
+      - name: Resolve SHAs (wal2 + trunk) and merge trunk→wal2
+        id: merge
+        run: |
+          set -euxo pipefail
+          cd sqlite-src/repo
+
+          # Get a deterministic WAL2 base
+          fossil update wal2
+          WAL2_SHA=$(fossil info | awk '/^checkout:/ {print $2}')
+
+          # Pick trunk tip or the provided TRUNK_SHA
+          if [ -z "${TRUNK_SHA}" ]; then
+            fossil update trunk
+          else
+            fossil update "${TRUNK_SHA}"
+          fi
+          TRUNK_SHA_RESOLVED=$(fossil info | awk '/^checkout:/ {print $2}')
+
+          # Merge trunk into wal2
+          fossil update "$WAL2_SHA"
+          fossil merge  "$TRUNK_SHA_RESOLVED"
+
+          echo "wal2_sha=$WAL2_SHA"            >> "$GITHUB_OUTPUT"
+          echo "trunk_sha=$TRUNK_SHA_RESOLVED" >> "$GITHUB_OUTPUT"
+
       - name: Restore amalgamation cache
         id: cache-amalg
         uses: actions/cache@v4
         with:
           path: sqlite-src/out
-          key: sqlite-wal2-${{ steps.wal2.outputs.sha }}-${{ env.FLAGS_REV }}
+          key: sqlite-merge-wal2-${{ steps.merge.outputs.wal2_sha }}-trunk-${{ steps.merge.outputs.trunk_sha }}-${{ env.FLAGS_REV }}
 
-      # Build amalgamation when cache is cold
       - name: Configure & build amalgamation (sqlite3.c / sqlite3.h)
         if: steps.cache-amalg.outputs.cache-hit != 'true'
         run: |
           set -euxo pipefail
           cd sqlite-src/repo
-          fossil update "${{ steps.wal2.outputs.sha }}"
           ./configure
           make sqlite3.c sqlite3.h
           cp tsrc/sqlite3ext.h . || cp src/sqlite3ext.h .
           mkdir -p ../out
           cp sqlite3.c sqlite3.h sqlite3ext.h ../out/
-          echo "${{ steps.wal2.outputs.sha }}" > ../out/WAL2_SHA.txt
+          {
+            echo "WAL2_SHA=${{ steps.merge.outputs.wal2_sha }}"
+            echo "TRUNK_SHA=${{ steps.merge.outputs.trunk_sha }}"
+          } > ../out/MERGE_BASE.txt
 
-      # Inject feature flags into the artifact's sqlite3.c so all platforms compile with them
-      - name: Inject compile flags into amalgamation (prepend to sqlite3.c)
+      - name: Prepend compile flags into sqlite3.c (deterministic enable)
         run: |
           set -euxo pipefail
           f=sqlite-src/out/sqlite3.c
           test -f "$f"
-      
-          # Only prepend once (safe if cache is reused)
-          if ! grep -q 'SQLITE_ENABLE_NAN_INF' "$f"; then
+          # Only prepend once (safe with cache)
+          if ! head -n 30 "$f" | grep -q 'SQLITE_ENABLE_NAN_INF'; then
             tmp=$(mktemp)
             {
               echo '#define NDEBUG 1'
+              # Old + new names; harmless if unused in this snapshot
+              echo '#define SQLITE_ENABLE_NAN_INF 1'
+              echo '#define SQLITE_ENABLE_JSON_NAN_INF 1'
+              # Your other feature flags
               echo '#define SQLITE_ENABLE_JSON1 1'
               echo '#define SQLITE_ENABLE_FTS5 1'
               echo '#define SQLITE_ENABLE_RTREE 1'
@@ -92,16 +121,13 @@ jobs:
               echo '#define SQLITE_DEFAULT_MEMSTATUS 0'
               echo '#define SQLITE_THREADSAFE 2'
               echo '#define SQLITE_OMIT_DEPRECATED 1'
-              echo '#define SQLITE_ENABLE_NAN_INF 1'
               cat "$f"
             } > "$tmp"
             mv "$tmp" "$f"
           fi
-      
-          head -n 12 "$f"
+          head -n 20 "$f"
 
-
-      - name: Upload amalgamation artifact (incl. pinned SHA)
+      - name: Upload amalgamation artifact
         uses: actions/upload-artifact@v4
         with:
           name: sqlite-wal2-amalgamation
@@ -304,7 +330,7 @@ jobs:
           CIBW_BUILD: "cp39-macosx_* cp310-macosx_* cp311-macosx_* cp312-macosx_*"
           CIBW_ARCHS_MACOS: "x86_64"
           CIBW_BEFORE_BUILD: "python -m pip install -U setuptools wheel && cd {package} && python setup.py build_static"
-          CIBW_ENVIRONMENT_MACOS: 'MACOSX_DEPLOYMENT_TARGET=10.9 CFLAGS="${{ env.POSIX_BASE_CFLAGS }}" CPPFLAGS="$CFLAGS"'
+          CIBW_ENVIRONMENT_MACOS: 'MACOSX_DEPLOYMENT_TARGET=10.13 CFLAGS="${{ env.POSIX_BASE_CFLAGS }}" CPPFLAGS="$CFLAGS"'
           CIBW_BUILD_VERBOSITY: "1"
         run: python -m cibuildwheel pysqlite3-src --output-dir wheelhouse
       - uses: actions/upload-artifact@v4
