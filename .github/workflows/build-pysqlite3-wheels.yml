@@ -21,22 +21,19 @@ env:
 
 jobs:
   prep-sqlite-amalgamation:
-    name: Prepare SQLite WAL2+trunk(amalgamation) (cached)
+    name: Prepare SQLite WAL2 (pinned) + nan-inf merge
     runs-on: ubuntu-latest
     env:
-      # Optional: set this to a specific trunk check-in (short or full SHA).
-      # Leave empty to use current trunk tip.
-      TRUNK_SHA: "96ec83064"
-
-      # Bump when you change the define set to invalidate cache
-      FLAGS_REV: "v2"
+      WAL2_PIN: "db44f17a84"     # WAL2 pin near Mar 24, 2023
+      NANINF_SHA: "96ec830645"   # nan-inf feature check-in (ENABLE_NAN_INF)
+      FLAGS_REV: "v3"            # bump to invalidate cache when flags change
     steps:
       - name: Install prerequisites
         run: |
           set -euxo pipefail
           sudo apt-get update
           sudo apt-get install -y fossil tcl build-essential
-
+  
       - name: Clone & open SQLite repo
         run: |
           set -euxo pipefail
@@ -44,39 +41,33 @@ jobs:
           fossil clone https://sqlite.org/src sqlite.fossil
           mkdir repo && cd repo
           fossil open ../sqlite.fossil
-
-      - name: Resolve SHAs (wal2 + trunk) and merge trunk→wal2
+  
+      - name: Merge WAL2 pin into nan-inf check-in
         id: merge
         run: |
           set -euxo pipefail
           cd sqlite-src/repo
-
-          # Get a deterministic WAL2 base
-          fossil update wal2
-          WAL2_SHA=$(fossil info | awk '/^checkout:/ {print $2}')
-
-          # Pick trunk tip or the provided TRUNK_SHA
-          if [ -z "${TRUNK_SHA}" ]; then
-            fossil update trunk
-          else
-            fossil update "${TRUNK_SHA}"
+          # Start on nan-inf, then merge the WAL2 pin (often fewer conflicts this way)
+          fossil update "${NANINF_SHA}"
+          NAN_SHA=$(fossil info | awk '/^checkout:/ {print $2}')
+          fossil merge "${WAL2_PIN}"
+  
+          echo "wal2_sha=${WAL2_PIN}"   >> "$GITHUB_OUTPUT"
+          echo "naninf_sha=${NAN_SHA}"  >> "$GITHUB_OUTPUT"
+  
+          # Fail early if merge conflicts exist (prevents compiling conflict markers)
+          if grep -R "BEGIN MERGE CONFLICT" -n .; then
+            echo "Merge conflicts detected; try another WAL2 pin or reverse merge direction." >&2
+            exit 1
           fi
-          TRUNK_SHA_RESOLVED=$(fossil info | awk '/^checkout:/ {print $2}')
-
-          # Merge trunk into wal2
-          fossil update "$WAL2_SHA"
-          fossil merge  "$TRUNK_SHA_RESOLVED"
-
-          echo "wal2_sha=$WAL2_SHA"            >> "$GITHUB_OUTPUT"
-          echo "trunk_sha=$TRUNK_SHA_RESOLVED" >> "$GITHUB_OUTPUT"
-
+  
       - name: Restore amalgamation cache
         id: cache-amalg
         uses: actions/cache@v4
         with:
           path: sqlite-src/out
-          key: sqlite-merge-wal2-${{ steps.merge.outputs.wal2_sha }}-trunk-${{ steps.merge.outputs.trunk_sha }}-${{ env.FLAGS_REV }}
-
+          key: sqlite-merge-wal2-${{ steps.merge.outputs.wal2_sha }}-naninf-${{ steps.merge.outputs.naninf_sha }}-${{ env.FLAGS_REV }}
+  
       - name: Configure & build amalgamation (sqlite3.c / sqlite3.h)
         if: steps.cache-amalg.outputs.cache-hit != 'true'
         run: |
@@ -89,49 +80,44 @@ jobs:
           cp sqlite3.c sqlite3.h sqlite3ext.h ../out/
           {
             echo "WAL2_SHA=${{ steps.merge.outputs.wal2_sha }}"
-            echo "TRUNK_SHA=${{ steps.merge.outputs.trunk_sha }}"
+            echo "NANINF_SHA=${{ steps.merge.outputs.naninf_sha }}"
           } > ../out/MERGE_BASE.txt
-
-      - name: Prepend compile flags into sqlite3.c (deterministic enable)
+  
+      - name: Prepend compile flags into sqlite3.c
         run: |
           set -euxo pipefail
           f=sqlite-src/out/sqlite3.c
           test -f "$f"
-          # Only prepend once (safe with cache)
-          if ! head -n 30 "$f" | grep -q 'SQLITE_ENABLE_NAN_INF'; then
-            tmp=$(mktemp)
-            {
-              echo '#define NDEBUG 1'
-              # Old + new names; harmless if unused in this snapshot
-              echo '#define SQLITE_ENABLE_NAN_INF 1'
-              echo '#define SQLITE_ENABLE_JSON_NAN_INF 1'
-              # Your other feature flags
-              echo '#define SQLITE_ENABLE_JSON1 1'
-              echo '#define SQLITE_ENABLE_FTS5 1'
-              echo '#define SQLITE_ENABLE_RTREE 1'
-              echo '#define SQLITE_ENABLE_STAT4 1'
-              echo '#define SQLITE_ENABLE_MATH_FUNCTIONS 1'
-              echo '#define SQLITE_ENABLE_NORMALIZE 1'
-              echo '#define SQLITE_ENABLE_DESERIALIZE 1'
-              echo '#define SQLITE_ENABLE_DBPAGE_VTAB 1'
-              echo '#define SQLITE_ENABLE_DBSTAT_VTAB 1'
-              echo '#define SQLITE_ENABLE_STMTVTAB 1'
-              echo '#define SQLITE_ENABLE_COLUMN_METADATA 1'
-              echo '#define SQLITE_LIKE_DOESNT_MATCH_BLOBS 1'
-              echo '#define SQLITE_DEFAULT_MEMSTATUS 0'
-              echo '#define SQLITE_THREADSAFE 2'
-              echo '#define SQLITE_OMIT_DEPRECATED 1'
-              cat "$f"
-            } > "$tmp"
-            mv "$tmp" "$f"
-          fi
+          tmp=$(mktemp)
+          {
+            echo '#define NDEBUG 1'
+            echo '#define SQLITE_ENABLE_NAN_INF 1'
+            echo '#define SQLITE_ENABLE_JSON_NAN_INF 1'
+            echo '#define SQLITE_ENABLE_JSON1 1'
+            echo '#define SQLITE_ENABLE_FTS5 1'
+            echo '#define SQLITE_ENABLE_RTREE 1'
+            echo '#define SQLITE_ENABLE_STAT4 1'
+            echo '#define SQLITE_ENABLE_MATH_FUNCTIONS 1'
+            echo '#define SQLITE_ENABLE_NORMALIZE 1'
+            echo '#define SQLITE_ENABLE_DESERIALIZE 1'
+            echo '#define SQLITE_ENABLE_DBPAGE_VTAB 1'
+            echo '#define SQLITE_ENABLE_DBSTAT_VTAB 1'
+            echo '#define SQLITE_ENABLE_STMTVTAB 1'
+            echo '#define SQLITE_ENABLE_COLUMN_METADATA 1'
+            echo '#define SQLITE_LIKE_DOESNT_MATCH_BLOBS 1'
+            echo '#define SQLITE_DEFAULT_MEMSTATUS 0'
+            echo '#define SQLITE_THREADSAFE 2'
+            echo '#define SQLITE_OMIT_DEPRECATED 1'
+            cat "$f"
+          } > "$tmp"
+          mv "$tmp" "$f"
           head -n 20 "$f"
-
-      - name: Upload amalgamation artifact
-        uses: actions/upload-artifact@v4
+  
+      - uses: actions/upload-artifact@v4
         with:
           name: sqlite-wal2-amalgamation
           path: sqlite-src/out/*
+
 
   # ---------- Linux manylinux ----------
   linux-manylinux-x86_64:
