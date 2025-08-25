@@ -269,7 +269,7 @@ jobs:
           CIBW_BUILD: "cp39-macosx_* cp310-macosx_* cp311-macosx_* cp312-macosx_*"
           CIBW_ARCHS_MACOS: "x86_64"
           CIBW_BEFORE_BUILD: "python -m pip install -U setuptools wheel && cd {package} && python setup.py build_static"
-          CIBW_ENVIRONMENT_MACOS: 'MACOSX_DEPLOYMENT_TARGET=10.9 CFLAGS="-O3 -fPIC -DNDEBUG ${{ env.POSIX_SQLITE_DEFINES }}"'
+          CIBW_ENVIRONMENT_MACOS: 'MACOSX_DEPLOYMENT_TARGET=10.13 CFLAGS="-O3 -fPIC -DNDEBUG ${{ env.POSIX_SQLITE_DEFINES }}"'
           CIBW_BUILD_VERBOSITY: "1"
         run: python -m cibuildwheel pysqlite3-src --output-dir wheelhouse
       - uses: actions/upload-artifact@v4
